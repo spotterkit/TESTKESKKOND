@@ -1,4 +1,4 @@
-const CACHE_NAME = 'tehnikatuvastus-offline-diag-v9';
+const CACHE_NAME = 'tehnikatuvastus-offline-render-v10';
 const CORE_ASSETS = [
   './', './index.html', './manifest.json', './icon-192.png', './icon-512.png',
   './apple-touch-icon.png', './offline-sw.js', './offline-assets.json'
@@ -27,7 +27,7 @@ self.addEventListener('fetch', event => {
     // Seda rada EI TOHI kunagi võrku edasi saata: vastus peab tulema cache'ist.
     if(url.origin === self.location.origin && url.pathname.includes('/__offline_image__/')){
       const offlineCache = await caches.open(CACHE_NAME);
-      const offlineImage = await offlineCache.match(event.request, {ignoreVary:true});
+      const offlineImage = await offlineCache.match(event.request, {ignoreVary:true, ignoreSearch:true});
       if(offlineImage) return offlineImage;
       return new Response('', {status: 404, statusText: 'Offline image not cached'});
     }
