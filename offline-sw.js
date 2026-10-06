@@ -1,4 +1,13 @@
 const CACHE_NAME = 'tehnikatuvastus-offline-final-v13';
+
+
+const SW_VERSION = 'v13-sw-version-check';
+self.addEventListener('message', event => {
+  if(event.data === 'whoami' && event.ports && event.ports[0]){
+    event.ports[0].postMessage({SW_VERSION, CACHE_NAME});
+  }
+});
+
 const CORE_ASSETS = [
   './', './index.html', './manifest.json', './icon-192.png', './icon-512.png',
   './apple-touch-icon.png', './offline-sw.js', './offline-assets.json'
