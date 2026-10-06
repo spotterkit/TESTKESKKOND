@@ -569,8 +569,10 @@
           <button id="offlineDeleteBtn" type="button" style="flex:1; display:none;">Kustuta offline andmed</button>
           <button id="offlineDiagBtn" type="button" style="flex:1;">Kontrolli offline pilte</button>
           <button id="commonsAuditBtn" type="button" style="flex:1;">Auditeeri Commonsi pilte</button>
+          <button id="roundTripAuditBtn" type="button" style="flex:1;">Auditeeri cache round-trip</button>
         </div>
         <div id="offlineStatus" class="stats-line" style="margin-top:8px;">Offline-versiooni pole veel seadmesse laaditud.</div>
+        <pre id="roundTripAuditOutput" style="display:none; white-space:pre-wrap; word-break:break-word; margin-top:10px; padding:10px; border:1px solid rgba(255,255,255,.18); border-radius:8px; font-size:12px; line-height:1.45; max-height:520px; overflow:auto;"></pre>
         <pre id="commonsAuditOutput" style="display:none; white-space:pre-wrap; word-break:break-word; margin-top:10px; padding:10px; border:1px solid rgba(255,255,255,.18); border-radius:8px; font-size:12px; line-height:1.45; max-height:520px; overflow:auto;"></pre>
         <pre id="offlineDiagOutput" style="display:none; white-space:pre-wrap; word-break:break-word; margin-top:10px; padding:10px; border:1px solid rgba(255,255,255,.18); border-radius:8px; font-size:12px; line-height:1.45; max-height:360px; overflow:auto;"></pre>
       </div>
@@ -1364,7 +1366,7 @@ function normalizeFilename(raw){
   return f.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-const OFFLINE_CACHE_NAME = 'tehnikatuvastus-offline-render-v10';
+const OFFLINE_CACHE_NAME = 'tehnikatuvastus-offline-roundtrip-v12';
 const OFFLINE_MAP_KEY = './__offline_commons_map__.json';
 let offlineCommonsMapMemo = null;
 
@@ -2515,7 +2517,9 @@ showHomeScreen();
   const diagOut = document.getElementById('offlineDiagOutput');
   const auditBtn = document.getElementById('commonsAuditBtn');
   const auditOut = document.getElementById('commonsAuditOutput');
-  if(!btn || !delBtn || !status || !diagBtn || !diagOut || !auditBtn || !auditOut) return;
+  const roundTripBtn = document.getElementById('roundTripAuditBtn');
+  const roundTripOut = document.getElementById('roundTripAuditOutput');
+  if(!btn || !delBtn || !status || !diagBtn || !diagOut || !auditBtn || !auditOut || !roundTripBtn || !roundTripOut) return;
 
   const CACHE_NAME = OFFLINE_CACHE_NAME;
   const MAP_KEY = './__offline_commons_map__.json';
@@ -2977,6 +2981,125 @@ showHomeScreen();
     auditOut.textContent=lines.join('\n');
     auditBtn.disabled=false; diagBtn.disabled=false; btn.disabled=false;
   }
+
+
+  async function runRoundTripAudit(){
+    if(!navigator.onLine){
+      roundTripOut.style.display='block';
+      roundTripOut.textContent='Cache round-trip audit vajab internetiühendust, sest iga Commonsi pilt laaditakse kontrolliks uuesti.';
+      return;
+    }
+    roundTripBtn.disabled=true; auditBtn.disabled=true; diagBtn.disabled=true; btn.disabled=true;
+    roundTripOut.style.display='block';
+    const names=commonsFilenames();
+    const cache=await caches.open(CACHE_NAME);
+    const map=await readMap(cache);
+    const rows=[];
+    let next=0, done=0;
+    roundTripOut.textContent=`CACHE ROUND-TRIP AUDIT: 0 / ${names.length}`;
+
+    async function one(name){
+      const row={name,stage:'START',ok:false};
+      const info=map[offlineMapKey(name)] || map[name];
+      if(!info || !info.url){ row.stage='KAART'; row.detail='offline-kaardis puudub Commons URL'; return row; }
+      row.commonsUrl=info.url;
+      const auditUrl=new URL('./__offline_image__/__roundtrip__/' + encodeURIComponent(offlineMapKey(name)), location.href).href;
+      row.auditUrl=auditUrl;
+      try{
+        row.stage='DOWNLOAD';
+        const src=await fetch(info.url,{mode:'cors',cache:'no-store'});
+        row.httpStatus=src.status; row.sourceResponseType=src.type;
+        if(!src.ok) throw new Error('HTTP '+src.status);
+        const blob=await src.blob();
+        row.sourceBlobSize=blob.size; row.sourceBlobType=blob.type;
+        if(!blob.size) throw new Error('tühi Blob');
+
+        row.stage='SOURCE DECODE';
+        const srcDec=await decodeBlob(blob,12000);
+        row.sourceDecode=srcDec;
+        if(!srcDec.ok) throw new Error(srcDec.detail);
+
+        row.stage='CACHE PUT';
+        const ct=blob.type || src.headers.get('Content-Type') || 'image/jpeg';
+        const localResponse=new Response(blob,{status:200,headers:{'Content-Type':ct,'Content-Length':String(blob.size),'Cache-Control':'public, max-age=31536000, immutable'}});
+        await cache.put(auditUrl,localResponse);
+
+        row.stage='CACHE MATCH';
+        const hit=await cache.match(auditUrl,{ignoreVary:true});
+        if(!hit) throw new Error('cache.match ei leidnud äsja salvestatud kirjet');
+        row.cachedType=hit.type; row.cachedStatus=hit.status; row.cachedContentType=hit.headers.get('Content-Type')||'';
+        const cachedBlob=await hit.clone().blob();
+        row.cachedBlobSize=cachedBlob.size; row.cachedBlobType=cachedBlob.type;
+        if(!cachedBlob.size) throw new Error('cache Blob on tühi');
+
+        row.stage='CACHE BLOB DECODE';
+        const cacheDec=await decodeBlob(cachedBlob,12000);
+        row.cacheDecode=cacheDec;
+        if(!cacheDec.ok) throw new Error(cacheDec.detail);
+
+        row.stage='SW FETCH';
+        const sw=await fetch(auditUrl,{cache:'no-store'});
+        row.swStatus=sw.status; row.swType=sw.type; row.swContentType=sw.headers.get('Content-Type')||'';
+        if(!sw.ok) throw new Error('HTTP '+sw.status);
+        const swBlob=await sw.clone().blob();
+        row.swBlobSize=swBlob.size; row.swBlobType=swBlob.type;
+        if(!swBlob.size) throw new Error('SW Blob on tühi');
+
+        row.stage='SW BLOB DECODE';
+        const swDec=await decodeBlob(swBlob,12000);
+        row.swDecode=swDec;
+        if(!swDec.ok) throw new Error(swDec.detail);
+
+        row.stage='IMG RENDER';
+        const ir=await waitForImage(auditUrl,12000);
+        row.imgRender=ir;
+        if(!ir.ok) throw new Error(ir.detail);
+        row.ok=true; row.stage='OK'; row.detail=ir.detail;
+      }catch(e){ row.detail=String(e&&e.message||e); }
+      finally{ try{ await cache.delete(auditUrl,{ignoreVary:true}); }catch(e){} }
+      return row;
+    }
+
+    async function worker(){
+      while(true){
+        const i=next++; if(i>=names.length) return;
+        const row=await one(names[i]); rows[i]=row; done++;
+        if(done%3===0 || done===names.length) roundTripOut.textContent=`CACHE ROUND-TRIP AUDIT: ${done} / ${names.length}…`;
+      }
+    }
+    try{
+      await Promise.all(Array.from({length:3},()=>worker()));
+      const stages={}; let ok=0;
+      for(const r of rows){ if(r&&r.ok) ok++; else { const k=(r&&r.stage)||'TUNDMATU'; stages[k]=(stages[k]||0)+1; } }
+      const bad=rows.filter(r=>r&&!r.ok);
+      const lines=[];
+      lines.push('CACHE ROUND-TRIP AUDIT');
+      lines.push(`Kontrollitud: ${rows.length}`);
+      lines.push(`Täielikult OK: ${ok}`);
+      lines.push(`Vigu: ${bad.length}`);
+      lines.push(`SW controller: ${navigator.serviceWorker.controller ? 'JAH' : 'EI'}`);
+      if(Object.keys(stages).length){ lines.push(''); lines.push('VEAD ETAPI KAUPA'); for(const [k,v] of Object.entries(stages)) lines.push(`${k}: ${v}`); }
+      if(bad.length){
+        lines.push(''); lines.push(`PROBLEEMSED FAILID (${bad.length})`);
+        for(const r of bad.slice(0,30)){
+          lines.push(''); lines.push('---');
+          lines.push(`FAIL: ${r.name}`); lines.push(`ETAPP: ${r.stage}`); lines.push(`DETAIL: ${r.detail||''}`);
+          if(r.commonsUrl) lines.push(`COMMONS: ${r.commonsUrl}`);
+          if(r.sourceBlobSize!==undefined) lines.push(`SOURCE BLOB: ${r.sourceBlobSize} B · ${r.sourceBlobType||''} · decode=${r.sourceDecode&&r.sourceDecode.ok?'OK':'?'}`);
+          if(r.cachedBlobSize!==undefined) lines.push(`CACHE BLOB: ${r.cachedBlobSize} B · ${r.cachedBlobType||''} · response=${r.cachedType||''}/${r.cachedStatus||''} · decode=${r.cacheDecode&&r.cacheDecode.ok?'OK':'?'}`);
+          if(r.swStatus!==undefined) lines.push(`SW: HTTP ${r.swStatus} · response=${r.swType||''} · ${r.swContentType||''} · blob=${r.swBlobSize||0} B · decode=${r.swDecode&&r.swDecode.ok?'OK':'?'}`);
+          if(r.imgRender) lines.push(`IMG: ${r.imgRender.ok?'OK':'VIGA'} · ${r.imgRender.detail||''}`);
+        }
+        if(bad.length>30) lines.push(`\n… veel ${bad.length-30} probleemset faili (kuvamata).`);
+      }else{
+        lines.push(''); lines.push('Kõik 313 pilti läbisid kogu ahela: download → Blob → cache.put → cache.match → cache Blob decode → Service Worker fetch → SW Blob decode → <img> render.');
+      }
+      roundTripOut.textContent=lines.join('\n');
+    }catch(e){ roundTripOut.textContent='ROUND-TRIP AUDITI VIGA: '+String(e&&e.stack||e); }
+    finally{ roundTripBtn.disabled=false; auditBtn.disabled=false; diagBtn.disabled=false; btn.disabled=false; }
+  }
+
+  roundTripBtn.addEventListener('click', runRoundTripAudit);
 
   auditBtn.addEventListener('click', runCommonsAudit);
 
