@@ -2494,8 +2494,10 @@ showHomeScreen();
   const status = document.getElementById('offlineStatus');
   if(!btn || !delBtn || !status) return;
 
-  const CACHE_NAME = 'tehnikatuvastus-offline-v2';
+  const CACHE_NAME = 'tehnikatuvastus-offline-v3';
   const MAP_KEY = './__offline_commons_map__.json';
+  const API_BATCH_SIZE = 25;
+  const DOWNLOAD_CONCURRENCY = 8;
 
   if(!('serviceWorker' in navigator) || !('caches' in window)){
     btn.disabled = true;
@@ -2526,6 +2528,39 @@ showHomeScreen();
   async function writeMap(cache, map){
     await cache.put(MAP_KEY, new Response(JSON.stringify(map), {headers:{'Content-Type':'application/json'}}));
     offlineCommonsMapMemo = map;
+  }
+
+  function chunks(arr, size){
+    const out=[];
+    for(let i=0;i<arr.length;i+=size) out.push(arr.slice(i,i+size));
+    return out;
+  }
+
+  async function resolveCommonsBatch(batch, map){
+    const titles = batch.map(name => 'File:' + name).join('|');
+    const api = 'https://commons.wikimedia.org/w/api.php?action=query'
+      + '&titles=' + encodeURIComponent(titles)
+      + '&prop=imageinfo&iiprop=url|size|mime|extmetadata&iiurlwidth=1400&format=json&origin=*';
+    const r = await fetch(api, {cache:'no-store'});
+    if(!r.ok) throw new Error('api');
+    const data = await r.json();
+    const pages = data.query && data.query.pages ? Object.values(data.query.pages) : [];
+    const resolved = new Set();
+    for(const page of pages){
+      const ii = page && page.imageinfo && page.imageinfo[0];
+      if(!page || page.missing !== undefined || !ii || !ii.mime || !ii.mime.startsWith('image/')) continue;
+      const raw = String(page.title || '').replace(/^File:/i,'').replace(/ /g,'_');
+      const name = normalizeFilename(raw);
+      const ext = ii.extmetadata || {};
+      map[name] = {
+        url: ii.thumburl || ii.url,
+        filepageUrl: 'https://commons.wikimedia.org/wiki/' + encodeURIComponent(page.title.replace(/ /g,'_')),
+        artist: stripHtml(ext.Artist && ext.Artist.value),
+        license: stripHtml(ext.LicenseShortName && ext.LicenseShortName.value)
+      };
+      resolved.add(name);
+    }
+    return resolved;
   }
 
   async function updateOfflineState(){
@@ -2562,7 +2597,6 @@ showHomeScreen();
       await reg.update();
       const cache = await caches.open(CACHE_NAME);
 
-      // 1) Rakenduse kest + repo lokaalsed pildid.
       const response = await fetch('./offline-assets.json', {cache:'no-store'});
       if(!response.ok) throw new Error('manifest');
       const assets = await response.json();
@@ -2576,49 +2610,62 @@ showHomeScreen();
         status.textContent = `Rakenduse failid: ${coreDone} / ${assets.length}`;
       }
 
-      // 2) Commonsi pildid. Olemasolevad cache-kirjed jäetakse puutumata.
       const names = commonsFilenames();
       const map = await readMap(cache);
-      let done = 0, added = 0, failed = 0;
-      for(const name of names){
-        done++;
+      const unresolved = names.filter(name => !map[name] || !map[name].url);
+      let apiDone = 0, failed = 0;
+      const apiBatches = chunks(unresolved, API_BATCH_SIZE);
+      for(const batch of apiBatches){
         try{
-          let info = map[name];
-          if(!info || !info.url){
-            const title = 'File:' + name;
-            const api = 'https://commons.wikimedia.org/w/api.php?action=query'
-              + '&titles=' + encodeURIComponent(title)
-              + '&prop=imageinfo&iiprop=url|size|mime|extmetadata&iiurlwidth=1400&format=json&origin=*';
-            const r = await fetch(api, {cache:'no-store'});
-            if(!r.ok) throw new Error('api');
-            const data = await r.json();
-            const page = data.query && data.query.pages && Object.values(data.query.pages)[0];
-            const ii = page && page.imageinfo && page.imageinfo[0];
-            if(!page || page.missing !== undefined || !ii || !ii.mime || !ii.mime.startsWith('image/')) throw new Error('missing');
-            const ext = ii.extmetadata || {};
-            info = {
-              url: ii.thumburl || ii.url,
-              filepageUrl: 'https://commons.wikimedia.org/wiki/' + encodeURIComponent(page.title.replace(/ /g,'_')),
-              artist: stripHtml(ext.Artist && ext.Artist.value),
-              license: stripHtml(ext.LicenseShortName && ext.LicenseShortName.value)
-            };
-            map[name] = info;
+          const resolved = await resolveCommonsBatch(batch, map);
+          failed += batch.length - resolved.size;
+        }catch(e){
+          // Kui paketipäring ebaõnnestub, proovi selle paketi faile ühekaupa,
+          // et üks vigane kirje ei peataks ülejäänud offline-paketti.
+          for(const name of batch){
+            try{
+              const resolved = await resolveCommonsBatch([name], map);
+              if(!resolved.has(name)) failed++;
+            }catch(err){ failed++; }
           }
-
-          const existing = await cache.match(info.url);
-          if(!existing){
-            const imgRes = await fetch(info.url, {mode:'no-cors', cache:'reload'});
-            await cache.put(info.url, imgRes.clone());
-            added++;
-          }
-        }catch(e){ failed++; }
-        if(done % 10 === 0) await writeMap(cache, map);
-        status.textContent = `Commonsi pildid: ${done} / ${names.length}` + (added ? ` · uusi ${added}` : '') + (failed ? ` · vigu ${failed}` : '');
+        }
+        apiDone += batch.length;
+        status.textContent = `Pildiandmed: ${Math.min(apiDone, unresolved.length)} / ${unresolved.length}` + (failed ? ` · vigu ${failed}` : '');
       }
       await writeMap(cache, map);
+
+      const jobs = names.filter(name => map[name] && map[name].url);
+      let next = 0, done = 0, added = 0, downloadFailed = 0;
+      const startedAt = performance.now();
+      async function worker(){
+        while(true){
+          const idx = next++;
+          if(idx >= jobs.length) return;
+          const name = jobs[idx];
+          const info = map[name];
+          try{
+            const existing = await cache.match(info.url);
+            if(!existing){
+              const imgRes = await fetch(info.url, {mode:'no-cors', cache:'reload'});
+              await cache.put(info.url, imgRes.clone());
+              added++;
+            }
+          }catch(e){ downloadFailed++; }
+          done++;
+          const pct = jobs.length ? Math.round(done / jobs.length * 100) : 100;
+          const sec = Math.max(0.1, (performance.now() - startedAt) / 1000);
+          const rate = done / sec;
+          const remain = rate > 0 ? Math.ceil((jobs.length - done) / rate) : 0;
+          status.textContent = `Pildid: ${done} / ${jobs.length} · ${pct}%` + (added ? ` · uusi ${added}` : '') + (downloadFailed ? ` · vigu ${downloadFailed}` : '') + (remain > 0 ? ` · ~${remain}s` : '');
+        }
+      }
+      await Promise.all(Array.from({length: Math.min(DOWNLOAD_CONCURRENCY, Math.max(1,jobs.length))}, () => worker()));
+      await writeMap(cache, map);
+
+      const totalFailed = failed + downloadFailed;
       btn.textContent = 'Uuenda offline andmeid';
       delBtn.style.display = '';
-      status.textContent = `✓ Offline kasutuseks valmis (${Object.keys(map).length} Commonsi pilti + kohalikud pildid)` + (failed ? ` · ${failed} pilti jäi laadimata.` : '.');
+      status.textContent = `✓ Offline kasutuseks valmis (${Object.keys(map).length} Commonsi pilti + kohalikud pildid)` + (totalFailed ? ` · ${totalFailed} pilti jäi laadimata.` : '.');
     }catch(err){
       status.textContent = 'Offline-laadimine ebaõnnestus. Kontrolli internetiühendust ja proovi uuesti.';
     }finally{
