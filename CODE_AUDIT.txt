@@ -1,0 +1,26 @@
+TEHNIKATUVASTUS – struktuuri ja koodi audit
+
+TEHTUD
+- 44 lokaalset pilti liigutatud images/<group>/ alamkaustadesse.
+- Kõik vastavad index.html files[] viited uuendatud.
+- Kontroll: 44 aktiivset lokaalset pildiviidet, 0 puuduvat faili.
+- Eemaldatud images/test.txt (testjäänuk).
+- Eemaldatud kasutamata .group-btn CSS ja selle .cnt alamreegel.
+- Eemaldatud tühi CSS-reegel #homeScreen + *{}.
+- Eemaldatud eksitav vana kommentaarinäide images/t90m_01.jpg.
+
+TEADLIKULT ALLES JÄETUD
+- QR-koodi minifitseeritud generaator: kasutuses QR-paneeli jaoks.
+- imageDiagStyles / imageDiagScript: pildidiagnostika funktsionaalsus.
+- Manifesti ja PWA metaelemendid: kasutuses installitava/äpisarnase veebivaate alusena.
+- HTML id-d, mida JavaScript otseselt ei loe, kuid mis võivad olla semantilised või tulevase CSS/DOM-i ankrud; neid ei eemaldatud ilma funktsionaalse vajaduseta.
+
+LISATUD
+- tools/organise_images.py
+  Vaikimisi dry-run; --apply liigutab uued images/<fail> kirjed automaatselt nende group-kategooria alamkausta ja uuendab index.html viited.
+
+KONTROLLID
+- JavaScript syntax: OK (node --check).
+- Aktiivsed lokaalsed pilditeed: 44.
+- Puuduvad lokaalsed pildifailid: 0.
+- images/ juurkausta jäänud failid: 0.
