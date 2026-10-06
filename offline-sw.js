@@ -1,4 +1,4 @@
-const CACHE_NAME = 'tehnikatuvastus-offline-roundtrip-v12';
+const CACHE_NAME = 'tehnikatuvastus-offline-final-v13';
 const CORE_ASSETS = [
   './', './index.html', './manifest.json', './icon-192.png', './icon-512.png',
   './apple-touch-icon.png', './offline-sw.js', './offline-assets.json'
