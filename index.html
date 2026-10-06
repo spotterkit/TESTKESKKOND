@@ -1367,6 +1367,18 @@ function normalizeFilename(raw){
 const OFFLINE_CACHE_NAME = 'tehnikatuvastus-offline-final-v13';
 const OFFLINE_MAP_KEY = './__offline_commons_map__.json';
 let offlineCommonsMapMemo = null;
+let offlineCachedUrlMemo = null;
+
+async function getOfflineCachedUrls(){
+  if(offlineCachedUrlMemo) return offlineCachedUrlMemo;
+  if(!('caches' in window)) return new Set();
+  try{
+    const cache = await caches.open(OFFLINE_CACHE_NAME);
+    const requests = await cache.keys();
+    offlineCachedUrlMemo = new Set(requests.map(r => r.url).filter(u => u.includes('/__offline_image__/')));
+  }catch(e){ offlineCachedUrlMemo = new Set(); }
+  return offlineCachedUrlMemo;
+}
 
 async function getOfflineCommonsMap(){
   if(offlineCommonsMapMemo) return offlineCommonsMapMemo;
@@ -1394,7 +1406,10 @@ async function getOfflineCommonsEntry(filename){
   const map = await getOfflineCommonsMap();
   const entry = map[offlineMapKey(filename)] || map[normalizeFilename(filename)] || null;
   if(!entry) return null;
-  return {...entry, url: entry.offlineUrl || offlineImageUrl(filename)};
+  const virtualUrl = entry.offlineUrl || offlineImageUrl(filename);
+  const cachedUrls = await getOfflineCachedUrls();
+  if(!cachedUrls.has(new URL(virtualUrl, window.location.href).href)) return null;
+  return {...entry, url: virtualUrl};
 }
 
 async function fetchSpecificFile(filename){
@@ -2517,15 +2532,24 @@ showHomeScreen();
   const status = document.getElementById('offlineStatus');
   if(!btn || !delBtn || !status) return;
 
-  const CACHE_NAME = OFFLINE_CACHE_NAME;
+  const MEDIA_CACHE = OFFLINE_CACHE_NAME; // NIME EI TOHI MUUTA: olemasolev media säilib release'ide vahel.
+  const APP_CACHE_PREFIX = 'tehnikatuvastus-app-';
   const MAP_KEY = './__offline_commons_map__.json';
   const API_BATCH_SIZE = 25;
   const DOWNLOAD_CONCURRENCY = 8;
+  let offlineInstallRunning = false;
+  const hadController = !!navigator.serviceWorker.controller;
+  let controllerReloaded = false;
+  let swRegistration = null;
 
   if(!('serviceWorker' in navigator) || !('caches' in window)){
     btn.disabled = true;
     status.textContent = 'See brauser ei toeta offline-režiimi.';
     return;
+  }
+
+  function isHomeIdle(){
+    return homeScreen && getComputedStyle(homeScreen).display !== 'none' && !offlineInstallRunning;
   }
 
   function commonsFilenames(){
@@ -2542,21 +2566,18 @@ showHomeScreen();
   }
 
   async function readMap(cache){
-    try{
-      const r = await cache.match(MAP_KEY);
-      return r ? await r.json() : {};
-    }catch(e){ return {}; }
+    try{ const r = await cache.match(MAP_KEY); return r ? await r.json() : {}; }
+    catch(e){ return {}; }
   }
 
   async function writeMap(cache, map){
     await cache.put(MAP_KEY, new Response(JSON.stringify(map), {headers:{'Content-Type':'application/json'}}));
     offlineCommonsMapMemo = map;
+    offlineCachedUrlMemo = null;
   }
 
   function chunks(arr, size){
-    const out=[];
-    for(let i=0;i<arr.length;i+=size) out.push(arr.slice(i,i+size));
-    return out;
+    const out=[]; for(let i=0;i<arr.length;i+=size) out.push(arr.slice(i,i+size)); return out;
   }
 
   async function resolveCommonsBatch(batch, map){
@@ -2570,29 +2591,16 @@ showHomeScreen();
     const data = await r.json();
     const pages = data.query && data.query.pages ? Object.values(data.query.pages) : [];
     const normalizedLinks = new Map();
-    for(const n of (data.query && data.query.normalized || [])){
-      normalizedLinks.set(normalizeFilename(String(n.to||'').replace(/^File:/i,'')).toLowerCase(), normalizeFilename(String(n.from||'').replace(/^File:/i,'')));
-    }
-    for(const rdir of (data.query && data.query.redirects || [])){
-      normalizedLinks.set(normalizeFilename(String(rdir.to||'').replace(/^File:/i,'')).toLowerCase(), normalizeFilename(String(rdir.from||'').replace(/^File:/i,'')));
-    }
+    for(const n of (data.query && data.query.normalized || [])) normalizedLinks.set(normalizeFilename(String(n.to||'').replace(/^File:/i,'')).toLowerCase(), normalizeFilename(String(n.from||'').replace(/^File:/i,'')));
+    for(const rd of (data.query && data.query.redirects || [])) normalizedLinks.set(normalizeFilename(String(rd.to||'').replace(/^File:/i,'')).toLowerCase(), normalizeFilename(String(rd.from||'').replace(/^File:/i,'')));
     const resolved = new Set();
     for(const page of pages){
       const ii = page && page.imageinfo && page.imageinfo[0];
       if(!page || page.missing !== undefined || !ii || !ii.mime || !ii.mime.startsWith('image/')) continue;
-      const raw = String(page.title || '').replace(/^File:/i,'');
-      const canonicalName = normalizeFilename(raw);
+      const canonicalName = normalizeFilename(String(page.title || '').replace(/^File:/i,''));
       const ext = ii.extmetadata || {};
-      const info = {
-        url: ii.thumburl || ii.url,
-        offlineUrl: offlineImageUrl(canonicalName),
-        filepageUrl: 'https://commons.wikimedia.org/wiki/' + encodeURIComponent(page.title.replace(/ /g,'_')),
-        artist: stripHtml(ext.Artist && ext.Artist.value),
-        license: stripHtml(ext.LicenseShortName && ext.LicenseShortName.value)
-      };
-      map[offlineMapKey(canonicalName)] = info;
-      map[canonicalName] = info;
-      resolved.add(canonicalName);
+      const info = {url:ii.thumburl || ii.url, offlineUrl:offlineImageUrl(canonicalName), filepageUrl:'https://commons.wikimedia.org/wiki/' + encodeURIComponent(page.title.replace(/ /g,'_')), artist:stripHtml(ext.Artist && ext.Artist.value), license:stripHtml(ext.LicenseShortName && ext.LicenseShortName.value)};
+      map[offlineMapKey(canonicalName)] = info; map[canonicalName] = info; resolved.add(canonicalName);
       const alias = normalizedLinks.get(canonicalName.toLowerCase());
       if(alias){ map[offlineMapKey(alias)] = info; map[alias] = info; resolved.add(alias); }
       const requested = requestedByKey.get(canonicalName.toLowerCase());
@@ -2601,210 +2609,150 @@ showHomeScreen();
     return resolved;
   }
 
-  function formatMB(bytes){
-    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-  }
+  function formatMB(bytes){ return (bytes / (1024 * 1024)).toFixed(1) + ' MB'; }
 
   async function getOfflineImageStats(cache, map, names){
-    let count = 0, bytes = 0;
-    const seen = new Set();
+    let count=0, bytes=0; const seen=new Set();
     for(const name of names){
-      const info = map[offlineMapKey(name)] || map[name];
-      if(!info) continue;
-      const url = info.offlineUrl || offlineImageUrl(name);
-      if(seen.has(url)) continue;
-      seen.add(url);
-      const res = await cache.match(url, {ignoreVary:true, ignoreSearch:true});
-      if(!res) continue;
-      count++;
-      const len = Number(res.headers.get('Content-Length') || 0);
-      if(len > 0) bytes += len;
-      else {
-        try{ bytes += (await res.clone().blob()).size || 0; }catch(e){}
-      }
+      const info=map[offlineMapKey(name)] || map[name]; if(!info) continue;
+      const url=info.offlineUrl || offlineImageUrl(name); if(seen.has(url)) continue; seen.add(url);
+      const res=await cache.match(url,{ignoreVary:true,ignoreSearch:true}); if(!res) continue;
+      count++; const len=Number(res.headers.get('Content-Length')||0);
+      if(len>0) bytes+=len; else try{ bytes+=(await res.clone().blob()).size||0; }catch(e){}
     }
-    return {count, bytes};
+    return {count,bytes};
   }
 
   async function updateOfflineState(){
-    const keys = await caches.keys();
-    if(keys.includes(CACHE_NAME)){
-      const cache = await caches.open(CACHE_NAME);
-      const map = await readMap(cache);
-      const names = commonsFilenames();
-      const stats = await getOfflineImageStats(cache, map, names);
-      if(stats.count > 0){
-        btn.textContent = stats.count === names.length ? 'Uuenda offline andmeid' : 'Jätka offline laadimist';
-        delBtn.style.display = '';
-        status.textContent = stats.count === names.length
-          ? `✓ Offline kasutuseks valmis · ${stats.count} pilti · ${formatMB(stats.bytes)}`
-          : `Offline-pakett pooleli · ${stats.count} / ${names.length} pilti · ${formatMB(stats.bytes)}`;
-      }else{
-        btn.textContent = 'Lae äpp offline kasutuseks';
-        delBtn.style.display = 'none';
-        status.textContent = 'Offline-versiooni pole veel seadmesse laaditud.';
-      }
+    const cache=await caches.open(MEDIA_CACHE); const map=await readMap(cache); const names=commonsFilenames();
+    const stats=await getOfflineImageStats(cache,map,names);
+    if(stats.count>0){
+      btn.textContent=stats.count===names.length?'Uuenda offline andmeid':'Jätka offline laadimist';
+      delBtn.style.display='';
+      status.textContent=stats.count===names.length?`✓ Offline kasutuseks valmis · ${stats.count} pilti · ${formatMB(stats.bytes)}`:`Offline-pakett pooleli · ${stats.count} / ${names.length} pilti · ${formatMB(stats.bytes)}`;
     }else{
-      btn.textContent = 'Lae äpp offline kasutuseks';
-      delBtn.style.display = 'none';
-      status.textContent = 'Offline-versiooni pole veel seadmesse laaditud.';
+      btn.textContent='Lae äpp offline kasutuseks'; delBtn.style.display='none'; status.textContent='Offline-versiooni pole veel seadmesse laaditud.';
     }
   }
 
-  let swControllerReloaded = false;
   navigator.serviceWorker.addEventListener('controllerchange', () => {
-    if(swControllerReloaded) return;
-    swControllerReloaded = true;
-    // Uus SW võtab kontrolli üle. Üks reload tagab, et uus index.html jõuab kohe kasutusse.
+    // Ära katkesta installi, testi ega Kuldvillakut. Kui leht avanes ilma kontrollerita,
+    // ei ole reload vajalik; uus kontroller teenindab järgmisi navigatsioone ise.
+    if(controllerReloaded || !hadController || !isHomeIdle()) return;
+    controllerReloaded=true;
     location.reload();
   });
 
-  navigator.serviceWorker.register('./offline-sw.js').then(async reg => {
-    await reg.update();
+  navigator.serviceWorker.register('./offline-sw.js', {updateViaCache:'none'}).then(async reg => {
+    swRegistration=reg;
+    try{ await reg.update(); }catch(e){}
     updateOfflineState();
-  }).catch(() => {
-    status.textContent = 'Offline-teenuse käivitamine ebaõnnestus.';
+  }).catch(() => { status.textContent='Offline-teenuse käivitamine ebaõnnestus.'; });
+
+  document.addEventListener('visibilitychange', () => {
+    if(document.visibilityState==='visible' && !offlineInstallRunning && swRegistration){
+      swRegistration.update().catch(()=>{});
+    }
   });
 
   btn.addEventListener('click', async () => {
-    btn.disabled = true;
-    delBtn.disabled = true;
-    status.textContent = 'Valmistan offline-paketti…';
+    btn.disabled=true; delBtn.disabled=true; offlineInstallRunning=true;
+    status.textContent='Valmistan offline-paketti…';
     try{
-      const reg = await navigator.serviceWorker.ready;
-      await reg.update();
-      const cache = await caches.open(CACHE_NAME);
+      await navigator.serviceWorker.ready;
+      const cache=await caches.open(MEDIA_CACHE);
 
-      const response = await fetch('./offline-assets.json', {cache:'no-store'});
+      // offline-assets.json ja selle failid kuuluvad media/offline paketti, mitte SW app-cache'i.
+      const response=await fetch('./offline-assets.json',{cache:'no-store'});
       if(!response.ok) throw new Error('manifest');
-      const assets = await response.json();
-      let coreDone = 0;
+      const assets=await response.json(); let coreDone=0;
       for(const asset of assets){
-        const req = new Request(asset, {cache:'reload'});
-        const res = await fetch(req);
-        if(!res.ok) throw new Error(asset);
-        await cache.put(req, res.clone());
-        coreDone++;
-        status.textContent = `Rakenduse failid: ${coreDone} / ${assets.length}`;
+        const req=new Request(asset,{cache:'reload'}); const res=await fetch(req);
+        if(!res.ok) throw new Error(asset); await cache.put(req,res.clone());
+        coreDone++; status.textContent=`Rakenduse failid: ${coreDone} / ${assets.length}`;
       }
 
-      const names = commonsFilenames();
-      // Ehita Commonsi kaart alati samast API-resolverist, mis läbis 313/313 auditi.
-      // Ära sõltu ühegi varasema offline-versiooni kaardist.
-      const map = {};
-      const unresolved = names.slice();
-      let apiDone = 0, failed = 0;
-      const apiBatches = chunks(unresolved, API_BATCH_SIZE);
-      for(const batch of apiBatches){
+      const names=commonsFilenames();
+      const oldMap=await readMap(cache);
+      const resolvedMap={};
+      let apiDone=0, apiFailed=0;
+      for(const batch of chunks(names,API_BATCH_SIZE)){
         try{
-          const resolved = await resolveCommonsBatch(batch, map);
-          failed += batch.length - resolved.size;
+          const resolved=await resolveCommonsBatch(batch,resolvedMap); apiFailed+=batch.length-resolved.size;
         }catch(e){
-          // Kui paketipäring ebaõnnestub, proovi selle paketi faile ühekaupa,
-          // et üks vigane kirje ei peataks ülejäänud offline-paketti.
           for(const name of batch){
-            try{
-              const resolved = await resolveCommonsBatch([name], map);
-              if(!resolved.has(name) && !resolved.has(normalizeFilename(name))) failed++;
-            }catch(err){ failed++; }
+            try{ const resolved=await resolveCommonsBatch([name],resolvedMap); if(!resolved.has(name)&&!resolved.has(normalizeFilename(name))) apiFailed++; }
+            catch(err){ apiFailed++; }
           }
         }
-        apiDone += batch.length;
-        status.textContent = `Pildiandmed: ${Math.min(apiDone, unresolved.length)} / ${unresolved.length}` + (failed ? ` · vigu ${failed}` : '');
+        apiDone+=batch.length;
+        status.textContent=`Pildiandmed: ${Math.min(apiDone,names.length)} / ${names.length}`+(apiFailed?` · vigu ${apiFailed}`:'');
       }
-      const jobs = names.filter(name => { const x = map[offlineMapKey(name)] || map[name]; return x && x.url; });
-      let next = 0, done = 0, added = 0, downloadFailed = 0, downloadedBytes = 0;
-      const startedAt = performance.now();
+      const listingComplete=apiFailed===0;
+      const workingMap=listingComplete?resolvedMap:{...oldMap,...resolvedMap};
+      const jobs=names.filter(name=>{const x=workingMap[offlineMapKey(name)]||workingMap[name];return x&&x.url;});
+      let next=0,done=0,added=0,downloadFailed=0,downloadedBytes=0; const startedAt=performance.now();
       async function worker(){
         while(true){
-          const idx = next++;
-          if(idx >= jobs.length) return;
-          const name = jobs[idx];
-          const info = map[offlineMapKey(name)] || map[name];
+          const idx=next++; if(idx>=jobs.length)return;
+          const name=jobs[idx], info=workingMap[offlineMapKey(name)]||workingMap[name];
           try{
-            const virtualUrl = info.offlineUrl || offlineImageUrl(name);
-            info.offlineUrl = virtualUrl;
-            const existing = await cache.match(virtualUrl, {ignoreVary:true});
+            const virtualUrl=info.offlineUrl||offlineImageUrl(name); info.offlineUrl=virtualUrl;
+            let existing=await cache.match(virtualUrl,{ignoreVary:true});
             if(!existing){
-              // Offline-pildiks on vaja loetavaid pildibaite. Opaque/no-cors vastus ei ole
-              // mobiilibrauserites usaldusväärselt uuesti renderdatav, seega nõuame CORS-vastust,
-              // loeme selle Blobiks ja loome sama päritolu puhta Response'i.
-              const imgRes = await fetch(info.url, {mode:'cors', cache:'reload'});
-              if(!imgRes.ok) throw new Error('image-http-' + imgRes.status);
-              const blob = await imgRes.blob();
-              if(!blob || !blob.size) throw new Error('image-empty');
-              const contentType = blob.type || imgRes.headers.get('Content-Type') || 'image/jpeg';
-              if(!contentType.toLowerCase().startsWith('image/')) throw new Error('image-content-type-' + contentType);
-              const localResponse = new Response(blob, {
-                status: 200,
-                headers: {
-                  'Content-Type': contentType,
-                  'Content-Length': String(blob.size),
-                  'Cache-Control': 'public, max-age=31536000, immutable'
-                }
-              });
-              // Salvesta renderdatav same-origin Response virtuaalse URL-i alla.
-              await cache.put(virtualUrl, localResponse);
-              const verified = await cache.match(virtualUrl, {ignoreVary:true});
-              if(!verified) throw new Error('cache-verify');
-              added++;
-              downloadedBytes += blob.size || 0;
+              const imgRes=await fetch(info.url,{mode:'cors',cache:'reload'}); if(!imgRes.ok)throw new Error('image-http-'+imgRes.status);
+              const blob=await imgRes.blob(); if(!blob||!blob.size)throw new Error('image-empty');
+              const contentType=blob.type||imgRes.headers.get('Content-Type')||'image/jpeg'; if(!contentType.toLowerCase().startsWith('image/'))throw new Error('image-content-type-'+contentType);
+              await cache.put(virtualUrl,new Response(blob,{status:200,headers:{'Content-Type':contentType,'Content-Length':String(blob.size),'Cache-Control':'public, max-age=31536000, immutable'}}));
+              existing=await cache.match(virtualUrl,{ignoreVary:true}); if(!existing)throw new Error('cache-verify');
+              added++; downloadedBytes+=blob.size||0;
             }
-          }catch(e){ downloadFailed++; }
-          done++;
-          const pct = jobs.length ? Math.round(done / jobs.length * 100) : 100;
-          const sec = Math.max(0.1, (performance.now() - startedAt) / 1000);
-          const rate = done / sec;
-          const remain = rate > 0 ? Math.ceil((jobs.length - done) / rate) : 0;
-          status.textContent = `Pildid: ${done} / ${jobs.length} · ${pct}%` + (downloadedBytes ? ` · ${formatMB(downloadedBytes)}` : '') + (added ? ` · uusi ${added}` : '') + (downloadFailed ? ` · vigu ${downloadFailed}` : '') + (remain > 0 ? ` · ~${remain}s` : '');
+          }catch(e){downloadFailed++;}
+          done++; const pct=jobs.length?Math.round(done/jobs.length*100):100; const sec=Math.max(.1,(performance.now()-startedAt)/1000); const rate=done/sec; const remain=rate>0?Math.ceil((jobs.length-done)/rate):0;
+          status.textContent=`Pildid ${done} / ${jobs.length} · ${pct}%`+(downloadedBytes?` · ${formatMB(downloadedBytes)}`:'')+(added?` · uusi ${added}`:'')+(downloadFailed?` · vigu ${downloadFailed}`:'')+(remain>0?` · ~${remain}s`:'');
         }
       }
-      await Promise.all(Array.from({length: Math.min(DOWNLOAD_CONCURRENCY, Math.max(1,jobs.length))}, () => worker()));
-      await writeMap(cache, map);
+      await Promise.all(Array.from({length:Math.min(DOWNLOAD_CONCURRENCY,Math.max(1,jobs.length))},()=>worker()));
 
-      const missingNames = names.filter(name => { const x = map[offlineMapKey(name)] || map[name]; return !x || !x.url; });
-      let missingCached = 0;
-      for(const name of names){
-        const x = map[offlineMapKey(name)] || map[name];
-        if(!x || !x.url) continue;
-        const virtualUrl = x.offlineUrl || offlineImageUrl(name);
-        if(!(await cache.match(virtualUrl, {ignoreVary:true}))) missingCached++;
+      // Map'i lähevad ainult kirjed, mille virtuaalne pilt on päriselt cache'is olemas.
+      const verifiedMap={};
+      for(const [key,info] of Object.entries(workingMap)){
+        if(!info||!info.url)continue;
+        const virtualUrl=info.offlineUrl||offlineImageUrl(key);
+        if(await cache.match(virtualUrl,{ignoreVary:true,ignoreSearch:true})) verifiedMap[key]={...info,offlineUrl:virtualUrl};
       }
-      const totalFailed = missingNames.length + missingCached;
-      const finalStats = await getOfflineImageStats(cache, map, names);
-      btn.textContent = totalFailed ? 'Jätka offline laadimist' : 'Uuenda offline andmeid';
-      delBtn.style.display = '';
-      status.textContent = totalFailed
-        ? `Offline-pakett pooleli · ${finalStats.count} / ${names.length} pilti · ${formatMB(finalStats.bytes)} · puudu ${totalFailed}`
-        : `✓ Offline kasutuseks valmis · ${finalStats.count} pilti · ${formatMB(finalStats.bytes)}`;
+
+      // Eemalda vanad virtuaalpildid ainult täieliku API listing'u korral.
+      if(listingComplete){
+        const keepUrls=new Set(Object.values(verifiedMap).map(x=>new URL(x.offlineUrl,window.location.href).href));
+        for(const req of await cache.keys()){
+          if(req.url.includes('/__offline_image__/')&&!keepUrls.has(req.url)) await cache.delete(req);
+        }
+      }
+      await writeMap(cache,verifiedMap);
+
+      const finalStats=await getOfflineImageStats(cache,verifiedMap,names);
+      const totalFailed=names.length-finalStats.count;
+      btn.textContent=totalFailed?'Jätka offline laadimist':'Uuenda offline andmeid'; delBtn.style.display='';
+      status.textContent=totalFailed?`Offline-pakett pooleli · ${finalStats.count} / ${names.length} pilti · ${formatMB(finalStats.bytes)} · puudu ${totalFailed}`:`✓ Offline kasutuseks valmis · ${finalStats.count} pilti · ${formatMB(finalStats.bytes)}`;
+      if(!totalFailed){ try{ await navigator.storage.persist?.(); }catch(e){} }
     }catch(err){
-      status.textContent = 'Offline-laadimine ebaõnnestus. Kontrolli internetiühendust ja proovi uuesti.';
+      status.textContent='Offline-laadimine ebaõnnestus. Kontrolli internetiühendust ja proovi uuesti.';
     }finally{
-      btn.disabled = false;
-      delBtn.disabled = false;
+      offlineInstallRunning=false; btn.disabled=false; delBtn.disabled=false;
     }
   });
 
-
-
   delBtn.addEventListener('click', async () => {
     if(!confirm('Kustutan sellest seadmest Tehnikatuvastuse offline-andmed? Online-versioon jääb alles.')) return;
-    btn.disabled = true;
-    delBtn.disabled = true;
-    status.textContent = 'Kustutan offline-andmeid…';
+    btn.disabled=true; delBtn.disabled=true; status.textContent='Kustutan offline-andmeid…';
     try{
-      const keys = await caches.keys();
-      await Promise.all(keys.filter(k => k.startsWith('tehnikatuvastus-offline-')).map(k => caches.delete(k)));
-      offlineCommonsMapMemo = null;
-      status.textContent = 'Offline andmed kustutatud. Äpp töötab internetiga tavaliselt edasi.';
-      btn.textContent = 'Lae äpp offline kasutuseks';
-      delBtn.style.display = 'none';
-    }catch(e){
-      status.textContent = 'Offline-andmete kustutamine ebaõnnestus.';
-    }finally{
-      btn.disabled = false;
-      delBtn.disabled = false;
-    }
+      const keys=await caches.keys();
+      await Promise.all(keys.filter(k=>k.startsWith('tehnikatuvastus-offline-')||k.startsWith(APP_CACHE_PREFIX)).map(k=>caches.delete(k)));
+      offlineCommonsMapMemo=null; offlineCachedUrlMemo=null;
+      status.textContent='Offline andmed kustutatud. Äpp töötab internetiga tavaliselt edasi.'; btn.textContent='Lae äpp offline kasutuseks'; delBtn.style.display='none';
+    }catch(e){ status.textContent='Offline-andmete kustutamine ebaõnnestus.'; }
+    finally{ btn.disabled=false; delBtn.disabled=false; }
   });
 
   updateOfflineState();
