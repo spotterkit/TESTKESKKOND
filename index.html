@@ -1360,7 +1360,7 @@ function normalizeFilename(raw){
   return f.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-const OFFLINE_CACHE_NAME = 'tehnikatuvastus-offline-v5';
+const OFFLINE_CACHE_NAME = 'tehnikatuvastus-offline-v7';
 const OFFLINE_MAP_KEY = './__offline_commons_map__.json';
 let offlineCommonsMapMemo = null;
 
@@ -1375,9 +1375,13 @@ async function getOfflineCommonsMap(){
   return offlineCommonsMapMemo;
 }
 
+function offlineMapKey(filename){
+  return normalizeFilename(filename).toLocaleLowerCase('en-US');
+}
+
 async function getOfflineCommonsEntry(filename){
   const map = await getOfflineCommonsMap();
-  return map[normalizeFilename(filename)] || null;
+  return map[offlineMapKey(filename)] || map[normalizeFilename(filename)] || null;
 }
 
 async function fetchSpecificFile(filename){
@@ -2539,6 +2543,7 @@ showHomeScreen();
   }
 
   async function resolveCommonsBatch(batch, map){
+    const requestedByKey = new Map(batch.map(name => [normalizeFilename(name).toLowerCase(), normalizeFilename(name)]));
     const titles = batch.map(name => 'File:' + name).join('|');
     const api = 'https://commons.wikimedia.org/w/api.php?action=query'
       + '&titles=' + encodeURIComponent(titles)
@@ -2547,20 +2552,33 @@ showHomeScreen();
     if(!r.ok) throw new Error('api');
     const data = await r.json();
     const pages = data.query && data.query.pages ? Object.values(data.query.pages) : [];
+    const normalizedLinks = new Map();
+    for(const n of (data.query && data.query.normalized || [])){
+      normalizedLinks.set(normalizeFilename(String(n.to||'').replace(/^File:/i,'')).toLowerCase(), normalizeFilename(String(n.from||'').replace(/^File:/i,'')));
+    }
+    for(const rdir of (data.query && data.query.redirects || [])){
+      normalizedLinks.set(normalizeFilename(String(rdir.to||'').replace(/^File:/i,'')).toLowerCase(), normalizeFilename(String(rdir.from||'').replace(/^File:/i,'')));
+    }
     const resolved = new Set();
     for(const page of pages){
       const ii = page && page.imageinfo && page.imageinfo[0];
       if(!page || page.missing !== undefined || !ii || !ii.mime || !ii.mime.startsWith('image/')) continue;
       const raw = String(page.title || '').replace(/^File:/i,'');
-      const name = normalizeFilename(raw);
+      const canonicalName = normalizeFilename(raw);
       const ext = ii.extmetadata || {};
-      map[name] = {
+      const info = {
         url: ii.thumburl || ii.url,
         filepageUrl: 'https://commons.wikimedia.org/wiki/' + encodeURIComponent(page.title.replace(/ /g,'_')),
         artist: stripHtml(ext.Artist && ext.Artist.value),
         license: stripHtml(ext.LicenseShortName && ext.LicenseShortName.value)
       };
-      resolved.add(name);
+      map[offlineMapKey(canonicalName)] = info;
+      map[canonicalName] = info;
+      resolved.add(canonicalName);
+      const alias = normalizedLinks.get(canonicalName.toLowerCase());
+      if(alias){ map[offlineMapKey(alias)] = info; map[alias] = info; resolved.add(alias); }
+      const requested = requestedByKey.get(canonicalName.toLowerCase());
+      if(requested){ map[offlineMapKey(requested)] = info; map[requested] = info; resolved.add(requested); }
     }
     return resolved;
   }
@@ -2614,7 +2632,7 @@ showHomeScreen();
 
       const names = commonsFilenames();
       const map = await readMap(cache);
-      const unresolved = names.filter(name => !map[name] || !map[name].url);
+      const unresolved = names.filter(name => { const x = map[offlineMapKey(name)] || map[name]; return !x || !x.url; });
       let apiDone = 0, failed = 0;
       const apiBatches = chunks(unresolved, API_BATCH_SIZE);
       for(const batch of apiBatches){
@@ -2627,7 +2645,7 @@ showHomeScreen();
           for(const name of batch){
             try{
               const resolved = await resolveCommonsBatch([name], map);
-              if(!resolved.has(name)) failed++;
+              if(!resolved.has(name) && !resolved.has(normalizeFilename(name))) failed++;
             }catch(err){ failed++; }
           }
         }
@@ -2636,7 +2654,7 @@ showHomeScreen();
       }
       await writeMap(cache, map);
 
-      const jobs = names.filter(name => map[name] && map[name].url);
+      const jobs = names.filter(name => { const x = map[offlineMapKey(name)] || map[name]; return x && x.url; });
       let next = 0, done = 0, added = 0, downloadFailed = 0;
       const startedAt = performance.now();
       async function worker(){
@@ -2644,12 +2662,20 @@ showHomeScreen();
           const idx = next++;
           if(idx >= jobs.length) return;
           const name = jobs[idx];
-          const info = map[name];
+          const info = map[offlineMapKey(name)] || map[name];
           try{
-            const existing = await cache.match(info.url);
+            const existing = await cache.match(info.url, {ignoreVary:true});
             if(!existing){
-              const imgRes = await fetch(info.url, {mode:'no-cors', cache:'reload'});
+              let imgRes;
+              try{
+                imgRes = await fetch(info.url, {mode:'cors', cache:'reload'});
+                if(!imgRes.ok) throw new Error('image-http-' + imgRes.status);
+              }catch(corsErr){
+                imgRes = await fetch(info.url, {mode:'no-cors', cache:'reload'});
+              }
               await cache.put(info.url, imgRes.clone());
+              const verified = await cache.match(info.url, {ignoreVary:true});
+              if(!verified) throw new Error('cache-verify');
               added++;
             }
           }catch(e){ downloadFailed++; }
@@ -2664,10 +2690,19 @@ showHomeScreen();
       await Promise.all(Array.from({length: Math.min(DOWNLOAD_CONCURRENCY, Math.max(1,jobs.length))}, () => worker()));
       await writeMap(cache, map);
 
-      const totalFailed = failed + downloadFailed;
+      const missingNames = names.filter(name => { const x = map[offlineMapKey(name)] || map[name]; return !x || !x.url; });
+      let missingCached = 0;
+      for(const name of names){
+        const x = map[offlineMapKey(name)] || map[name];
+        if(!x || !x.url) continue;
+        if(!(await cache.match(x.url, {ignoreVary:true}))) missingCached++;
+      }
+      const totalFailed = missingNames.length + missingCached;
       btn.textContent = 'Uuenda offline andmeid';
       delBtn.style.display = '';
-      status.textContent = `✓ Offline kasutuseks valmis (${Object.keys(map).length} Commonsi pilti + kohalikud pildid)` + (totalFailed ? ` · ${totalFailed} pilti jäi laadimata.` : '.');
+      status.textContent = totalFailed
+        ? `Offline-pakett pole täielik: ${totalFailed} Commonsi pilti puudub. Vajuta "Uuenda offline andmeid".`
+        : `✓ Offline kasutuseks valmis (${names.length} Commonsi pilti + kohalikud pildid).`;
     }catch(err){
       status.textContent = 'Offline-laadimine ebaõnnestus. Kontrolli internetiühendust ja proovi uuesti.';
     }finally{
