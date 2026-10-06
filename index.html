@@ -567,9 +567,9 @@
         </div>
         <div class="row" style="margin-top:8px;">
           <button id="offlineDeleteBtn" type="button" style="flex:1; display:none;">Kustuta offline andmed</button>
-          <button id="offlineDiagBtn" type="button" style="flex:1;">Kontrolli SW/cache versiooni</button>
-          <button id="commonsAuditBtn" type="button" style="flex:1;">Auditeeri Commonsi pilte</button>
-          <button id="roundTripAuditBtn" type="button" style="flex:1;">Auditeeri cache round-trip</button>
+          <button id="offlineDiagBtn" type="button" style="flex:1;">Täielik offline kontroll</button>
+          <button id="commonsAuditBtn" type="button" style="display:none;">Auditeeri Commonsi pilte</button>
+          <button id="roundTripAuditBtn" type="button" style="display:none;">Auditeeri cache round-trip</button>
         </div>
         <div id="offlineStatus" class="stats-line" style="margin-top:8px;">Offline-versiooni pole veel seadmesse laaditud.</div>
         <pre id="roundTripAuditOutput" style="display:none; white-space:pre-wrap; word-break:break-word; margin-top:10px; padding:10px; border:1px solid rgba(255,255,255,.18); border-radius:8px; font-size:12px; line-height:1.45; max-height:520px; overflow:auto;"></pre>
@@ -2766,20 +2766,25 @@ showHomeScreen();
   async function runOfflineDiagnostics(){
     diagBtn.disabled = true;
     diagOut.style.display = 'block';
-    diagOut.textContent = 'Kontrollin SW/cache versiooni…';
+    diagOut.style.maxHeight = '620px';
+    diagOut.textContent = 'Teen täielikku offline kontrolli…';
     const lines = [];
+    const ok = (label, value='OK') => lines.push(`✓ ${label}: ${value}`);
+    const bad = (label, value='VIGA') => lines.push(`✗ ${label}: ${value}`);
     try{
-      lines.push(`LEHE OFFLINE_CACHE_NAME: ${OFFLINE_CACHE_NAME}`);
+      lines.push('TÄIELIK OFFLINE KONTROLL');
+      lines.push(`Aeg: ${new Date().toLocaleString()}`);
+      lines.push(`URL: ${location.href}`);
       lines.push(`navigator.onLine: ${navigator.onLine ? 'JAH' : 'EI'}`);
-      lines.push(`Controller: ${navigator.serviceWorker.controller ? (navigator.serviceWorker.controller.scriptURL || '(scriptURL puudub)') : 'PUUDUB'}`);
-      const keys = await caches.keys();
-      lines.push(`CACHE'ID: ${keys.length ? keys.join(', ') : '(puuduvad)'}`);
-
+      lines.push('');
+      lines.push('1. LEHT / SERVICE WORKER');
+      lines.push(`Lehe cache: ${OFFLINE_CACHE_NAME}`);
+      lines.push(`Controller: ${navigator.serviceWorker.controller ? navigator.serviceWorker.controller.scriptURL : 'PUUDUB'}`);
       const reg = await navigator.serviceWorker.ready;
+      lines.push(`SW scope: ${reg.scope}`);
+      lines.push(`SW active state: ${reg.active ? reg.active.state : 'PUUDUB'}`);
       const sw = navigator.serviceWorker.controller || reg.active;
-      if(!sw){
-        lines.push('SW WHOAMI: aktiivne Service Worker puudub');
-      }else{
+      if(sw){
         const ch = new MessageChannel();
         const reply = new Promise(resolve => {
           const timer = setTimeout(() => resolve({error:'timeout'}), 4000);
@@ -2788,16 +2793,109 @@ showHomeScreen();
         sw.postMessage('whoami', [ch.port2]);
         const info = await reply;
         if(info && !info.error){
-          lines.push(`SW VERSION: ${info.SW_VERSION || '(puudub)'}`);
-          lines.push(`SW CACHE_NAME: ${info.CACHE_NAME || '(puudub)'}`);
-          lines.push(`CACHE NIMED ÜHTIVAD: ${info.CACHE_NAME === OFFLINE_CACHE_NAME ? 'JAH' : 'EI'}`);
-        }else{
-          lines.push('SW WHOAMI: vastust ei tulnud 4 sekundi jooksul');
-          lines.push('See viitab tõenäoliselt sellele, et aktiivne SW on vanem versioon, milles whoami handler puudub.');
-        }
+          lines.push(`SW version: ${info.SW_VERSION || '(puudub)'}`);
+          lines.push(`SW cache: ${info.CACHE_NAME || '(puudub)'}`);
+          (info.CACHE_NAME === OFFLINE_CACHE_NAME ? ok : bad)('Lehe/SW cache nimi ühtib', info.CACHE_NAME === OFFLINE_CACHE_NAME ? 'JAH' : 'EI');
+        }else bad('SW whoami', 'vastust ei tulnud');
+      }else bad('Service Worker', 'aktiivne SW puudub');
+
+      lines.push('');
+      lines.push('2. CACHE STORAGE');
+      const cacheNames = await caches.keys();
+      lines.push(`Cache'id (${cacheNames.length}): ${cacheNames.join(', ') || '(puuduvad)'}`);
+      const matching = cacheNames.filter(k => k.startsWith('tehnikatuvastus-offline-'));
+      lines.push(`Tehnikatuvastuse cache'e: ${matching.length}`);
+      const cache = await caches.open(OFFLINE_CACHE_NAME);
+      const allReqs = await cache.keys();
+      lines.push(`Aktiivse cache'i kirjeid kokku: ${allReqs.length}`);
+      const virtualReqs = allReqs.filter(r => { try{return new URL(r.url).pathname.includes('/__offline_image__/');}catch(e){return false;} });
+      lines.push(`Virtuaalseid Commonsi pilte cache'is: ${virtualReqs.length}`);
+
+      lines.push('');
+      lines.push('3. OFFLINE MAP');
+      const mapRes = await cache.match(OFFLINE_MAP_KEY, {ignoreVary:true});
+      if(!mapRes) bad('Offline map', 'PUUDUB');
+      const map = mapRes ? await mapRes.clone().json() : {};
+      lines.push(`Map võtmeid kokku: ${Object.keys(map).length}`);
+      const names = commonsFilenames();
+      lines.push(`Commonsi lähtefailinimesid äpis: ${names.length}`);
+      let mapMissing=0, mapNoOffline=0, cacheMissing=0, urlMismatch=0;
+      const missingExamples=[];
+      for(const name of names){
+        const entry = map[offlineMapKey(name)] || map[normalizeFilename(name)];
+        if(!entry){ mapMissing++; if(missingExamples.length<5) missingExamples.push(`MAP: ${name}`); continue; }
+        const expected = offlineImageUrl(name);
+        const actual = entry.offlineUrl || expected;
+        if(!entry.offlineUrl) mapNoOffline++;
+        if(actual !== expected) urlMismatch++;
+        const hit = await cache.match(actual, {ignoreVary:true, ignoreSearch:true});
+        if(!hit){ cacheMissing++; if(missingExamples.length<5) missingExamples.push(`CACHE: ${name} -> ${actual}`); }
       }
+      (mapMissing===0 ? ok : bad)('Kõigil lähtefailidel map entry', `${names.length-mapMissing}/${names.length}`);
+      (mapNoOffline===0 ? ok : bad)('Kõigil map entrydel offlineUrl', `${names.length-mapNoOffline}/${names.length}`);
+      (urlMismatch===0 ? ok : bad)('offlineUrl vastab runtime offlineImageUrl()', urlMismatch===0 ? 'JAH' : `${urlMismatch} erinevust`);
+      (cacheMissing===0 ? ok : bad)('Kõik mapitud virtuaalpildid cache.is', `${names.length-cacheMissing-mapMissing}/${names.length}`);
+      if(missingExamples.length){ lines.push('Esimesed puuduvad:'); missingExamples.forEach(x=>lines.push('  '+x)); }
+
+      lines.push('');
+      lines.push('4. CORE ASSETS');
+      for(const asset of ['./index.html','./offline-sw.js','./offline-assets.json']){
+        const hit = await cache.match(asset, {ignoreVary:true});
+        lines.push(`${hit?'✓':'✗'} ${asset}: ${hit ? `${hit.status} ${hit.headers.get('Content-Type')||''}` : 'PUUDUB'}`);
+      }
+
+      lines.push('');
+      lines.push('5. PÄRIS RUNTIME AHEL');
+      const samples = names.slice(0, Math.min(5,names.length));
+      for(let i=0;i<samples.length;i++){
+        const name=samples[i];
+        lines.push(`\n[${i+1}] ${name}`);
+        const key=offlineMapKey(name);
+        lines.push(`key: ${key}`);
+        const entry=map[key] || map[normalizeFilename(name)];
+        if(!entry){ bad('map entry','PUUDUB'); continue; }
+        const vurl=entry.offlineUrl || offlineImageUrl(name);
+        lines.push(`offlineUrl: ${vurl}`);
+        const direct=await cache.match(vurl,{ignoreVary:true,ignoreSearch:true});
+        if(!direct){ bad('cache.match','PUUDUB'); continue; }
+        const directBlob=await direct.clone().blob();
+        lines.push(`cache.match: ${direct.status} · ${direct.headers.get('Content-Type')||directBlob.type||''} · ${directBlob.size} B`);
+        let swRes=null;
+        try{ swRes=await fetch(vurl,{cache:'no-store'}); lines.push(`SW fetch: HTTP ${swRes.status} · ${swRes.headers.get('Content-Type')||''}`); }
+        catch(e){ bad('SW fetch',e.message||String(e)); }
+        if(swRes && swRes.ok){ const b=await swRes.clone().blob(); lines.push(`SW blob: ${b.type||''} · ${b.size} B`); }
+        const render=await waitForImage(vurl,8000);
+        lines.push(`IMG render: ${render.ok?'OK':'VIGA'} · ${render.detail}`);
+        try{
+          const runtime=await fetchSpecificFile(name);
+          lines.push(`fetchSpecificFile: ${runtime && runtime.url ? runtime.url : 'URL PUUDUB'}`);
+          lines.push(`fetchSpecificFile isOffline: ${runtime && runtime.isOffline ? 'JAH':'EI'}`);
+          lines.push(`runtime URL == map URL: ${runtime && runtime.url===vurl ? 'JAH':'EI'}`);
+        }catch(e){ bad('fetchSpecificFile',e.message||String(e)); }
+      }
+
+      lines.push('');
+      lines.push('6. BRAUSERI SALVESTUS');
+      if(navigator.storage && navigator.storage.estimate){
+        const est=await navigator.storage.estimate();
+        const mb=n=>typeof n==='number'?(n/1024/1024).toFixed(1)+' MB':'?';
+        lines.push(`Kasutus: ${mb(est.usage)} / ${mb(est.quota)}`);
+      }else lines.push('Storage estimate: brauser ei toeta');
+      if(navigator.storage && navigator.storage.persisted){
+        try{ lines.push(`Persistent storage: ${(await navigator.storage.persisted())?'JAH':'EI'}`); }catch(e){}
+      }
+
+      lines.push('');
+      lines.push('7. KOKKUVÕTE');
+      if(mapMissing===0 && cacheMissing===0 && urlMismatch===0){
+        lines.push('Map ja cache on 313 faili tasemel kooskõlas. Kui ülal runtime/IMG ahelas tekib viga, on katkestus täpselt selle etapi juures.');
+      }else{
+        lines.push(`Map puudub: ${mapMissing}; cache puudub: ${cacheMissing}; URL erinevusi: ${urlMismatch}.`);
+      }
+      lines.push('Kopeeri kogu see raport ChatGPT-le.');
     }catch(err){
-      lines.push(`VIGA: ${err && err.message ? err.message : String(err)}`);
+      lines.push('');
+      lines.push(`KONTROLLI KRIITILINE VIGA: ${err && err.stack ? err.stack : String(err)}`);
     }finally{
       diagOut.textContent = lines.join('\n');
       diagBtn.disabled = false;
