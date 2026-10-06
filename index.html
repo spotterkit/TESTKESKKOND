@@ -1360,7 +1360,7 @@ function normalizeFilename(raw){
   return f.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-const OFFLINE_CACHE_NAME = 'tehnikatuvastus-offline-v7';
+const OFFLINE_CACHE_NAME = 'tehnikatuvastus-offline-v8';
 const OFFLINE_MAP_KEY = './__offline_commons_map__.json';
 let offlineCommonsMapMemo = null;
 
@@ -1379,9 +1379,18 @@ function offlineMapKey(filename){
   return normalizeFilename(filename).toLocaleLowerCase('en-US');
 }
 
+function offlineImageUrl(filename){
+  // Sama päritolu virtuaalne URL. Service Worker tagastab selle taga oleva
+  // Commonsi pildi Cache Storage'ist; offline <img> ei pöördu Wikimedia poole.
+  const key = offlineMapKey(filename);
+  return new URL('./__offline_image__/' + encodeURIComponent(key), window.location.href).href;
+}
+
 async function getOfflineCommonsEntry(filename){
   const map = await getOfflineCommonsMap();
-  return map[offlineMapKey(filename)] || map[normalizeFilename(filename)] || null;
+  const entry = map[offlineMapKey(filename)] || map[normalizeFilename(filename)] || null;
+  if(!entry) return null;
+  return {...entry, url: entry.offlineUrl || offlineImageUrl(filename)};
 }
 
 async function fetchSpecificFile(filename){
@@ -2568,6 +2577,7 @@ showHomeScreen();
       const ext = ii.extmetadata || {};
       const info = {
         url: ii.thumburl || ii.url,
+        offlineUrl: offlineImageUrl(canonicalName),
         filepageUrl: 'https://commons.wikimedia.org/wiki/' + encodeURIComponent(page.title.replace(/ /g,'_')),
         artist: stripHtml(ext.Artist && ext.Artist.value),
         license: stripHtml(ext.LicenseShortName && ext.LicenseShortName.value)
@@ -2664,7 +2674,9 @@ showHomeScreen();
           const name = jobs[idx];
           const info = map[offlineMapKey(name)] || map[name];
           try{
-            const existing = await cache.match(info.url, {ignoreVary:true});
+            const virtualUrl = info.offlineUrl || offlineImageUrl(name);
+            info.offlineUrl = virtualUrl;
+            const existing = await cache.match(virtualUrl, {ignoreVary:true});
             if(!existing){
               let imgRes;
               try{
@@ -2673,8 +2685,9 @@ showHomeScreen();
               }catch(corsErr){
                 imgRes = await fetch(info.url, {mode:'no-cors', cache:'reload'});
               }
-              await cache.put(info.url, imgRes.clone());
-              const verified = await cache.match(info.url, {ignoreVary:true});
+              // Salvesta välise Commonsi URL-i asemel sama päritolu virtuaalse võtme alla.
+              await cache.put(virtualUrl, imgRes.clone());
+              const verified = await cache.match(virtualUrl, {ignoreVary:true});
               if(!verified) throw new Error('cache-verify');
               added++;
             }
@@ -2695,7 +2708,8 @@ showHomeScreen();
       for(const name of names){
         const x = map[offlineMapKey(name)] || map[name];
         if(!x || !x.url) continue;
-        if(!(await cache.match(x.url, {ignoreVary:true}))) missingCached++;
+        const virtualUrl = x.offlineUrl || offlineImageUrl(name);
+        if(!(await cache.match(virtualUrl, {ignoreVary:true}))) missingCached++;
       }
       const totalFailed = missingNames.length + missingCached;
       btn.textContent = 'Uuenda offline andmeid';
