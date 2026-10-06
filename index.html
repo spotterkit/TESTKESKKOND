@@ -479,6 +479,51 @@
     text-transform:uppercase;color:var(--green);white-space:nowrap;
   }
 
+  /* Mobiil: mudeli nimi ja täpsustus peavad olema täielikult loetavad.
+     See plokk asub baasstiilidest PÄRAST, et desktopi min-width/display:contents ei kirjutaks mobiilivaadet üle. */
+  @media(max-width:480px){
+    .model-list-row{
+      display:grid;
+      grid-template-columns:minmax(0,1fr) auto;
+      column-gap:10px;
+      align-items:center;
+      padding:9px 0;
+    }
+    .model-list-row .m-text{
+      display:flex;
+      flex-wrap:wrap;
+      align-items:baseline;
+      gap:2px 6px;
+      min-width:0;
+      overflow:visible;
+    }
+    .model-list-row .m-name,
+    .model-list-row .m-type{
+      flex:0 1 auto;
+      min-width:0;
+      max-width:100%;
+      overflow:visible;
+      text-overflow:clip;
+      white-space:normal;
+      overflow-wrap:anywhere;
+      word-break:normal;
+    }
+    .model-list-row .m-name{
+      font-size:13px;
+      line-height:1.25;
+    }
+    .model-list-row .m-type{
+      font-size:11px;
+      line-height:1.25;
+    }
+    .model-list-row .m-status{
+      grid-column:2;
+      white-space:nowrap;
+      align-self:center;
+      font-size:10px;
+    }
+  }
+
   /* Mudeli pildigalerii */
   .model-list-row .m-status.is-clickable{cursor:pointer;text-decoration:underline;text-decoration-style:dotted;text-underline-offset:3px;}
   .model-list-row .m-status.is-clickable:hover{color:var(--amber);}
