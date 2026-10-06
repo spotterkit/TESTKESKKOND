@@ -1,4 +1,4 @@
-const CACHE_NAME = 'tehnikatuvastus-offline-v5';
+const CACHE_NAME = 'tehnikatuvastus-offline-v7';
 const CORE_ASSETS = [
   './', './index.html', './manifest.json', './icon-192.png', './icon-512.png',
   './apple-touch-icon.png', './offline-sw.js', './offline-assets.json'
@@ -21,7 +21,7 @@ self.addEventListener('activate', event => {
 self.addEventListener('fetch', event => {
   if(event.request.method !== 'GET') return;
   event.respondWith((async () => {
-    const cached = await caches.match(event.request);
+    const cached = await caches.match(event.request, {ignoreVary:true});
     if(cached) return cached;
     try{
       const response = await fetch(event.request);
