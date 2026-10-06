@@ -1358,7 +1358,7 @@ function normalizeFilename(raw){
   return f;
 }
 
-const OFFLINE_CACHE_NAME = 'tehnikatuvastus-offline-v2';
+const OFFLINE_CACHE_NAME = 'tehnikatuvastus-offline-v4';
 const OFFLINE_MAP_KEY = './__offline_commons_map__.json';
 let offlineCommonsMapMemo = null;
 
@@ -2494,7 +2494,7 @@ showHomeScreen();
   const status = document.getElementById('offlineStatus');
   if(!btn || !delBtn || !status) return;
 
-  const CACHE_NAME = 'tehnikatuvastus-offline-v3';
+  const CACHE_NAME = OFFLINE_CACHE_NAME;
   const MAP_KEY = './__offline_commons_map__.json';
   const API_BATCH_SIZE = 25;
   const DOWNLOAD_CONCURRENCY = 8;
