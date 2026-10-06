@@ -560,6 +560,12 @@
         <div class="row" style="margin-top:8px;">
           <button id="diagToggle" type="button" style="flex:1;">Pildidiagnostika</button>
         </div>
+
+        <div class="home-divider">Offline kasutus</div>
+        <div class="row">
+          <button id="offlineInstallBtn" type="button" style="flex:1;">Lae äpp offline kasutuseks</button>
+        </div>
+        <div id="offlineStatus" class="stats-line" style="margin-top:8px;">Offline-versiooni pole veel seadmesse laaditud.</div>
       </div>
       <div class="qr-panel" id="qrPanel">
         <div class="qr-eyebrow">Ava telefonis</div>
@@ -2438,6 +2444,62 @@ showHomeScreen();
    }
    start.disabled=false; progress.textContent+=' · VALMIS';
  };
+})();
+</script>
+
+<script>
+(function(){
+  const btn = document.getElementById('offlineInstallBtn');
+  const status = document.getElementById('offlineStatus');
+  if(!btn || !status) return;
+
+  if(!('serviceWorker' in navigator) || !('caches' in window)){
+    btn.disabled = true;
+    status.textContent = 'See brauser ei toeta offline-režiimi.';
+    return;
+  }
+
+  async function updateOfflineState(){
+    const keys = await caches.keys();
+    if(keys.includes('tehnikatuvastus-offline-v1')){
+      btn.textContent = 'Uuenda offline andmeid';
+      status.textContent = '✓ Rakenduse kest ja kohalikud pildid on offline kasutuseks valmis.';
+    }
+  }
+
+  navigator.serviceWorker.register('./offline-sw.js').then(updateOfflineState).catch(() => {
+    status.textContent = 'Offline-teenuse käivitamine ebaõnnestus.';
+  });
+
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    status.textContent = 'Laadin offline-faile seadmesse…';
+    try{
+      const reg = await navigator.serviceWorker.ready;
+      await reg.update();
+      const cache = await caches.open('tehnikatuvastus-offline-v1');
+      const response = await fetch('./offline-assets.json', {cache:'no-store'});
+      if(!response.ok) throw new Error('manifest');
+      const assets = await response.json();
+      let done = 0;
+      for(const asset of assets){
+        const req = new Request(asset, {cache:'reload'});
+        const res = await fetch(req);
+        if(!res.ok) throw new Error(asset);
+        await cache.put(req, res.clone());
+        done++;
+        status.textContent = `Laadin offline-faile: ${done} / ${assets.length}`;
+      }
+      btn.textContent = 'Uuenda offline andmeid';
+      status.textContent = `✓ Offline kasutuseks valmis (${assets.length} faili).`;
+    }catch(err){
+      status.textContent = 'Offline-laadimine ebaõnnestus. Kontrolli internetiühendust ja proovi uuesti.';
+    }finally{
+      btn.disabled = false;
+    }
+  });
+
+  updateOfflineState();
 })();
 </script>
 </body>
