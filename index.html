@@ -568,8 +568,10 @@
         <div class="row" style="margin-top:8px;">
           <button id="offlineDeleteBtn" type="button" style="flex:1; display:none;">Kustuta offline andmed</button>
           <button id="offlineDiagBtn" type="button" style="flex:1;">Kontrolli offline pilte</button>
+          <button id="commonsAuditBtn" type="button" style="flex:1;">Auditeeri Commonsi pilte</button>
         </div>
         <div id="offlineStatus" class="stats-line" style="margin-top:8px;">Offline-versiooni pole veel seadmesse laaditud.</div>
+        <pre id="commonsAuditOutput" style="display:none; white-space:pre-wrap; word-break:break-word; margin-top:10px; padding:10px; border:1px solid rgba(255,255,255,.18); border-radius:8px; font-size:12px; line-height:1.45; max-height:520px; overflow:auto;"></pre>
         <pre id="offlineDiagOutput" style="display:none; white-space:pre-wrap; word-break:break-word; margin-top:10px; padding:10px; border:1px solid rgba(255,255,255,.18); border-radius:8px; font-size:12px; line-height:1.45; max-height:360px; overflow:auto;"></pre>
       </div>
       <div class="qr-panel" id="qrPanel">
@@ -2511,7 +2513,9 @@ showHomeScreen();
   const status = document.getElementById('offlineStatus');
   const diagBtn = document.getElementById('offlineDiagBtn');
   const diagOut = document.getElementById('offlineDiagOutput');
-  if(!btn || !delBtn || !status || !diagBtn || !diagOut) return;
+  const auditBtn = document.getElementById('commonsAuditBtn');
+  const auditOut = document.getElementById('commonsAuditOutput');
+  if(!btn || !delBtn || !status || !diagBtn || !diagOut || !auditBtn || !auditOut) return;
 
   const CACHE_NAME = OFFLINE_CACHE_NAME;
   const MAP_KEY = './__offline_commons_map__.json';
@@ -2560,7 +2564,7 @@ showHomeScreen();
     const titles = batch.map(name => 'File:' + name).join('|');
     const api = 'https://commons.wikimedia.org/w/api.php?action=query'
       + '&titles=' + encodeURIComponent(titles)
-      + '&prop=imageinfo&iiprop=url|size|mime|extmetadata&iiurlwidth=1400&format=json&origin=*';
+      + '&redirects=1&prop=imageinfo&iiprop=url|size|mime|canonicaltitle|extmetadata&iiurlwidth=1400&format=json&origin=*';
     const r = await fetch(api, {cache:'no-store'});
     if(!r.ok) throw new Error('api');
     const data = await r.json();
@@ -2814,6 +2818,167 @@ showHomeScreen();
     diagOut.textContent=lines.join('\n');
     diagBtn.disabled=false;
   }
+
+
+  function auditFollowTitle(title, links){
+    let cur = title;
+    const seen = new Set();
+    for(let i=0;i<10;i++){
+      const key = cur.toLowerCase();
+      if(seen.has(key)) break;
+      seen.add(key);
+      const next = links.get(key);
+      if(!next) break;
+      cur = next;
+    }
+    return cur;
+  }
+
+  async function decodeBlob(blob, timeoutMs=10000){
+    const u = URL.createObjectURL(blob);
+    try{ return await waitForImage(u, timeoutMs); }
+    finally{ URL.revokeObjectURL(u); }
+  }
+
+  async function auditCommonsBatch(batch){
+    const titles = batch.map(name => 'File:' + normalizeFilename(name));
+    const api = 'https://commons.wikimedia.org/w/api.php?action=query'
+      + '&titles=' + encodeURIComponent(titles.join('|'))
+      + '&redirects=1&prop=imageinfo&iiprop=url|size|mime|canonicaltitle&iiurlwidth=1400&format=json&origin=*';
+    const r = await fetch(api, {cache:'no-store'});
+    if(!r.ok) throw new Error('API HTTP ' + r.status);
+    const data = await r.json();
+    const q = data.query || {};
+    const links = new Map();
+    const normalized = q.normalized || [];
+    const redirects = q.redirects || [];
+    for(const n of normalized) links.set(String(n.from||'').toLowerCase(), String(n.to||''));
+    for(const rd of redirects) links.set(String(rd.from||'').toLowerCase(), String(rd.to||''));
+    const pagesByTitle = new Map();
+    for(const page of Object.values(q.pages || {})) pagesByTitle.set(String(page.title||'').toLowerCase(), page);
+    const results=[];
+    for(const originalName of batch){
+      const requestedTitle = 'File:' + normalizeFilename(originalName);
+      const finalTitle = auditFollowTitle(requestedTitle, links);
+      const page = pagesByTitle.get(finalTitle.toLowerCase());
+      const norm = normalized.find(x => String(x.from||'').toLowerCase() === requestedTitle.toLowerCase());
+      let redirFrom = norm ? String(norm.to||'') : requestedTitle;
+      const redirectChain=[];
+      const seen=new Set();
+      for(let i=0;i<10;i++){
+        const rd = redirects.find(x => String(x.from||'').toLowerCase() === redirFrom.toLowerCase());
+        if(!rd || seen.has(String(rd.from).toLowerCase())) break;
+        seen.add(String(rd.from).toLowerCase()); redirectChain.push(`${rd.from} → ${rd.to}`); redirFrom=String(rd.to||'');
+      }
+      const ii = page && page.imageinfo && page.imageinfo[0];
+      results.push({
+        originalName,
+        requestedTitle,
+        normalizedTo: norm ? String(norm.to||'') : '',
+        redirectChain,
+        finalTitle: page ? String(page.title||'') : finalTitle,
+        found: !!(page && page.missing === undefined && ii),
+        mime: ii && ii.mime || '',
+        width: ii && ii.width || 0,
+        height: ii && ii.height || 0,
+        size: ii && ii.size || 0,
+        url: ii && (ii.thumburl || ii.url) || '',
+        originalUrl: ii && ii.url || ''
+      });
+    }
+    return results;
+  }
+
+  async function runCommonsAudit(){
+    if(!navigator.onLine){
+      auditOut.style.display='block';
+      auditOut.textContent='Commonsi audit vajab internetiühendust. Lülita internet sisse ja käivita audit uuesti.';
+      return;
+    }
+    auditBtn.disabled=true; diagBtn.disabled=true; btn.disabled=true;
+    auditOut.style.display='block';
+    const names=commonsFilenames();
+    auditOut.textContent=`Alustan Commonsi auditit: ${names.length} faili…`;
+    const rows=[];
+    let apiErrors=0;
+    const bs=chunks(names, 25);
+    for(let i=0;i<bs.length;i++){
+      try{ rows.push(...await auditCommonsBatch(bs[i])); }
+      catch(e){
+        apiErrors += bs[i].length;
+        for(const name of bs[i]) rows.push({originalName:name, requestedTitle:'File:'+normalizeFilename(name), found:false, apiError:String(e&&e.message||e), redirectChain:[]});
+      }
+      auditOut.textContent=`API kontroll: ${Math.min((i+1)*25,names.length)} / ${names.length}…`;
+    }
+
+    let next=0, checked=0;
+    async function worker(){
+      while(true){
+        const i=next++; if(i>=rows.length) return;
+        const row=rows[i];
+        if(row.found && row.url){
+          try{
+            const fr=await fetch(row.url,{mode:'cors',cache:'no-store'});
+            row.httpStatus=fr.status; row.responseType=fr.type;
+            if(!fr.ok) throw new Error('HTTP '+fr.status);
+            const blob=await fr.blob();
+            row.blobSize=blob.size; row.blobType=blob.type;
+            const dec=await decodeBlob(blob);
+            row.decodeOk=dec.ok; row.decodeDetail=dec.detail;
+          }catch(e){ row.downloadError=String(e&&e.message||e); row.decodeOk=false; }
+        }
+        checked++;
+        if(checked%5===0 || checked===rows.length) auditOut.textContent=`Pildi download/decode: ${checked} / ${rows.length}…`;
+      }
+    }
+    await Promise.all(Array.from({length:6},()=>worker()));
+
+    let ok=0, normalizedCount=0, redirectCount=0, missing=0, downloadErr=0, decodeErr=0, mimeOdd=0;
+    const bad=[];
+    for(const r of rows){
+      if(r.normalizedTo && r.normalizedTo.toLowerCase()!==r.requestedTitle.toLowerCase()) normalizedCount++;
+      if(r.redirectChain && r.redirectChain.length) redirectCount++;
+      if(!r.found){ missing++; bad.push({...r,reason:'COMMONSIST EI LEITUD'}); continue; }
+      if(!String(r.mime||'').startsWith('image/')){ mimeOdd++; bad.push({...r,reason:'MIME POLE IMAGE'}); continue; }
+      if(r.downloadError){ downloadErr++; bad.push({...r,reason:'DOWNLOAD ERROR'}); continue; }
+      if(!r.decodeOk){ decodeErr++; bad.push({...r,reason:'DECODE ERROR'}); continue; }
+      ok++;
+    }
+    const lines=[];
+    lines.push('COMMONSI PILTIDE AUDIT');
+    lines.push(`Kontrollitud: ${rows.length}`);
+    lines.push(`OK: ${ok}`);
+    lines.push(`API normaliseeris nime: ${normalizedCount}`);
+    lines.push(`Redirect: ${redirectCount}`);
+    lines.push(`Commonsist ei leitud: ${missing}`);
+    lines.push(`Download error: ${downloadErr}`);
+    lines.push(`Decode error: ${decodeErr}`);
+    lines.push(`Vale MIME: ${mimeOdd}`);
+    lines.push(`API paketivead: ${apiErrors}`);
+    if(bad.length){
+      lines.push(''); lines.push(`PROBLEEMSED FAILID (${bad.length})`);
+      for(const r of bad){
+        lines.push(''); lines.push('---');
+        lines.push(`Põhjus: ${r.reason}`);
+        lines.push(`ÄPI NIMI: ${r.originalName}`);
+        lines.push(`SAATSI API-LE: ${r.requestedTitle}`);
+        lines.push(`NORMALIZED: ${r.normalizedTo || '(ei muutnud)'}`);
+        lines.push(`REDIRECT: ${(r.redirectChain&&r.redirectChain.length) ? r.redirectChain.join(' | ') : '(puudub)'}`);
+        lines.push(`FINAL TITLE: ${r.finalTitle || '(puudub)'}`);
+        lines.push(`MIME: ${r.mime || '(puudub)'}`);
+        if(r.width||r.height) lines.push(`MÕÕDUD: ${r.width}x${r.height}`);
+        if(r.size) lines.push(`ORIG SUURUS: ${r.size} B`);
+        lines.push(`THUMB URL: ${r.url || '(puudub)'}`);
+        if(r.httpStatus!==undefined) lines.push(`HTTP: ${r.httpStatus} · response=${r.responseType||''}`);
+        if(r.blobSize!==undefined) lines.push(`BLOB: ${r.blobSize} B · ${r.blobType||'(tüüp puudub)'}`);
+        lines.push(`DECODE: ${r.decodeOk ? 'OK '+(r.decodeDetail||'') : 'VIGA '+(r.decodeDetail||r.downloadError||r.apiError||'')}`);
+      }
+    }else{ lines.push(''); lines.push('Kõik Commonsi pildid läbisid download/decode auditi.'); }
+    auditOut.textContent=lines.join('\n');
+    auditBtn.disabled=false; diagBtn.disabled=false; btn.disabled=false;
+  }
+
+  auditBtn.addEventListener('click', runCommonsAudit);
 
   diagBtn.addEventListener('click', runOfflineDiagnostics);
 
