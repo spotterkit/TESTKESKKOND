@@ -567,8 +567,10 @@
         </div>
         <div class="row" style="margin-top:8px;">
           <button id="offlineDeleteBtn" type="button" style="flex:1; display:none;">Kustuta offline andmed</button>
+          <button id="offlineDiagBtn" type="button" style="flex:1;">Kontrolli offline pilte</button>
         </div>
         <div id="offlineStatus" class="stats-line" style="margin-top:8px;">Offline-versiooni pole veel seadmesse laaditud.</div>
+        <pre id="offlineDiagOutput" style="display:none; white-space:pre-wrap; word-break:break-word; margin-top:10px; padding:10px; border:1px solid rgba(255,255,255,.18); border-radius:8px; font-size:12px; line-height:1.45; max-height:360px; overflow:auto;"></pre>
       </div>
       <div class="qr-panel" id="qrPanel">
         <div class="qr-eyebrow">Ava telefonis</div>
@@ -1360,7 +1362,7 @@ function normalizeFilename(raw){
   return f.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-const OFFLINE_CACHE_NAME = 'tehnikatuvastus-offline-v8';
+const OFFLINE_CACHE_NAME = 'tehnikatuvastus-offline-diag-v9';
 const OFFLINE_MAP_KEY = './__offline_commons_map__.json';
 let offlineCommonsMapMemo = null;
 
@@ -2507,7 +2509,9 @@ showHomeScreen();
   const btn = document.getElementById('offlineInstallBtn');
   const delBtn = document.getElementById('offlineDeleteBtn');
   const status = document.getElementById('offlineStatus');
-  if(!btn || !delBtn || !status) return;
+  const diagBtn = document.getElementById('offlineDiagBtn');
+  const diagOut = document.getElementById('offlineDiagOutput');
+  if(!btn || !delBtn || !status || !diagBtn || !diagOut) return;
 
   const CACHE_NAME = OFFLINE_CACHE_NAME;
   const MAP_KEY = './__offline_commons_map__.json';
@@ -2724,6 +2728,84 @@ showHomeScreen();
       delBtn.disabled = false;
     }
   });
+
+
+
+  async function waitForImage(url, timeoutMs=8000){
+    return await new Promise(resolve => {
+      const img = new Image();
+      let done = false;
+      const finish = (ok, detail) => { if(done) return; done=true; clearTimeout(timer); img.onload=null; img.onerror=null; resolve({ok, detail}); };
+      const timer = setTimeout(() => finish(false, 'timeout'), timeoutMs);
+      img.onload = () => finish(true, `${img.naturalWidth}x${img.naturalHeight}`);
+      img.onerror = () => finish(false, 'img.onerror');
+      img.src = url + (url.includes('?') ? '&' : '?') + '__diag=' + Date.now();
+    });
+  }
+
+  async function runOfflineDiagnostics(){
+    diagBtn.disabled = true;
+    diagOut.style.display = 'block';
+    diagOut.textContent = 'Kontrollin…';
+    const lines=[];
+    try{
+      lines.push(`navigator.onLine: ${navigator.onLine ? 'JAH' : 'EI'}`);
+      lines.push(`Service Worker tugi: ${'serviceWorker' in navigator ? 'JAH' : 'EI'}`);
+      lines.push(`SW controller: ${navigator.serviceWorker.controller ? 'JAH' : 'EI'}`);
+      if(navigator.serviceWorker.controller) lines.push(`SW script: ${navigator.serviceWorker.controller.scriptURL || '(teadmata)'}`);
+      const keys = await caches.keys();
+      lines.push(`Cache olemas (${CACHE_NAME}): ${keys.includes(CACHE_NAME) ? 'JAH' : 'EI'}`);
+      const cache = await caches.open(CACHE_NAME);
+      const map = await readMap(cache);
+      const names = commonsFilenames();
+      lines.push(`Commonsi lähtefailinimesid: ${names.length}`);
+      let mapped=0, cached=0, fetchOk=0, imgOk=0;
+      let firstFailure=null, sampleSuccess=null;
+      for(let i=0;i<names.length;i++){
+        const name=names[i];
+        const info=map[offlineMapKey(name)] || map[name];
+        if(!info || !info.url){ if(!firstFailure) firstFailure={name,stage:'KAART',detail:'kirje puudub'}; continue; }
+        mapped++;
+        const virtualUrl=info.offlineUrl || offlineImageUrl(name);
+        const hit=await cache.match(virtualUrl,{ignoreVary:true});
+        if(!hit){ if(!firstFailure) firstFailure={name,stage:'CACHE',detail:virtualUrl}; continue; }
+        cached++;
+        let fr=null;
+        try{
+          fr=await fetch(virtualUrl,{cache:'no-store'});
+          if(fr.ok){ fetchOk++; }
+          else if(!firstFailure) firstFailure={name,stage:'SW FETCH',detail:`HTTP ${fr.status} · type=${fr.type}`};
+        }catch(e){ if(!firstFailure) firstFailure={name,stage:'SW FETCH',detail:String(e && e.message || e)}; }
+        const ir=await waitForImage(virtualUrl);
+        if(ir.ok){ imgOk++; if(!sampleSuccess) sampleSuccess={name,detail:ir.detail}; }
+        else if(!firstFailure) firstFailure={name,stage:'IMG',detail:ir.detail};
+        // Esimese 5 cache-kirje tegelik renderdamine on piisav, et telefonis SW/Response probleem tuvastada.
+        if(cached>=5 && (firstFailure || imgOk>=5)) break;
+      }
+      lines.push(`Kaardistatud: ${mapped} / ${names.length}`);
+      lines.push(`Cache'ist leitud (kontrollitud osa): ${cached}`);
+      lines.push(`Virtuaal-URL fetch OK: ${fetchOk}`);
+      lines.push(`<img> render OK: ${imgOk}`);
+      if(sampleSuccess) lines.push(`Näidis OK: ${sampleSuccess.name} · ${sampleSuccess.detail}`);
+      if(firstFailure){
+        lines.push(''); lines.push('ESIMENE VIGA');
+        lines.push(`Fail: ${firstFailure.name}`);
+        lines.push(`Etapp: ${firstFailure.stage}`);
+        lines.push(`Detail: ${firstFailure.detail}`);
+        const info=map[offlineMapKey(firstFailure.name)] || map[firstFailure.name];
+        if(info){
+          lines.push(`Commons URL: ${info.url || '(puudub)'}`);
+          lines.push(`Offline URL: ${info.offlineUrl || offlineImageUrl(firstFailure.name)}`);
+          const hit=await cache.match(info.offlineUrl || offlineImageUrl(firstFailure.name),{ignoreVary:true});
+          if(hit) lines.push(`Cached Response: type=${hit.type} status=${hit.status} ok=${hit.ok}`);
+        }
+      }else if(mapped===names.length && cached>0 && imgOk>0){ lines.push(''); lines.push('Diagnostika kontrollitud osas viga ei leidnud.'); }
+    }catch(e){ lines.push('DIAGNOSTIKA VIGA: '+String(e && e.stack || e)); }
+    diagOut.textContent=lines.join('\n');
+    diagBtn.disabled=false;
+  }
+
+  diagBtn.addEventListener('click', runOfflineDiagnostics);
 
   delBtn.addEventListener('click', async () => {
     if(!confirm('Kustutan sellest seadmest Tehnikatuvastuse offline-andmed? Online-versioon jääb alles.')) return;
