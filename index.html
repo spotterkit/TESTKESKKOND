@@ -1366,7 +1366,7 @@ function normalizeFilename(raw){
   return f.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-const OFFLINE_CACHE_NAME = 'tehnikatuvastus-offline-roundtrip-v12';
+const OFFLINE_CACHE_NAME = 'tehnikatuvastus-offline-final-v13';
 const OFFLINE_MAP_KEY = './__offline_commons_map__.json';
 let offlineCommonsMapMemo = null;
 
@@ -2653,8 +2653,10 @@ showHomeScreen();
       }
 
       const names = commonsFilenames();
-      const map = await readMap(cache);
-      const unresolved = names.filter(name => { const x = map[offlineMapKey(name)] || map[name]; return !x || !x.url; });
+      // Ehita Commonsi kaart alati samast API-resolverist, mis läbis 313/313 auditi.
+      // Ära sõltu ühegi varasema offline-versiooni kaardist.
+      const map = {};
+      const unresolved = names.slice();
       let apiDone = 0, failed = 0;
       const apiBatches = chunks(unresolved, API_BATCH_SIZE);
       for(const batch of apiBatches){
