@@ -567,7 +567,7 @@
         </div>
         <div class="row" style="margin-top:8px;">
           <button id="offlineDeleteBtn" type="button" style="flex:1; display:none;">Kustuta offline andmed</button>
-          <button id="offlineDiagBtn" type="button" style="flex:1;">Kontrolli offline pilte</button>
+          <button id="offlineDiagBtn" type="button" style="flex:1;">Kontrolli SW/cache versiooni</button>
           <button id="commonsAuditBtn" type="button" style="flex:1;">Auditeeri Commonsi pilte</button>
           <button id="roundTripAuditBtn" type="button" style="flex:1;">Auditeeri cache round-trip</button>
         </div>
@@ -2766,133 +2766,42 @@ showHomeScreen();
   async function runOfflineDiagnostics(){
     diagBtn.disabled = true;
     diagOut.style.display = 'block';
-    diagOut.textContent = 'Kontrollin…';
-    const lines=[];
+    diagOut.textContent = 'Kontrollin SW/cache versiooni…';
+    const lines = [];
     try{
+      lines.push(`LEHE OFFLINE_CACHE_NAME: ${OFFLINE_CACHE_NAME}`);
       lines.push(`navigator.onLine: ${navigator.onLine ? 'JAH' : 'EI'}`);
-      lines.push(`Service Worker tugi: ${'serviceWorker' in navigator ? 'JAH' : 'EI'}`);
-      lines.push(`SW controller: ${navigator.serviceWorker.controller ? 'JAH' : 'EI'}`);
-      if(navigator.serviceWorker.controller) lines.push(`SW script: ${navigator.serviceWorker.controller.scriptURL || '(teadmata)'}`);
+      lines.push(`Controller: ${navigator.serviceWorker.controller ? (navigator.serviceWorker.controller.scriptURL || '(scriptURL puudub)') : 'PUUDUB'}`);
       const keys = await caches.keys();
-      lines.push(`Cache olemas (${CACHE_NAME}): ${keys.includes(CACHE_NAME) ? 'JAH' : 'EI'}`);
-      const cache = await caches.open(CACHE_NAME);
-      const map = await readMap(cache);
-      const names = commonsFilenames();
-      lines.push(`Commonsi lähtefailinimesid: ${names.length}`);
-      let mapped=0, cached=0, fetchOk=0, imgOk=0;
-      let firstFailure=null, sampleSuccess=null;
-      for(let i=0;i<names.length;i++){
-        const name=names[i];
-        const info=map[offlineMapKey(name)] || map[name];
-        if(!info || !info.url){ if(!firstFailure) firstFailure={name,stage:'KAART',detail:'kirje puudub'}; continue; }
-        mapped++;
-        const virtualUrl=info.offlineUrl || offlineImageUrl(name);
-        const hit=await cache.match(virtualUrl,{ignoreVary:true});
-        if(!hit){ if(!firstFailure) firstFailure={name,stage:'CACHE',detail:virtualUrl}; continue; }
-        cached++;
-        let fr=null;
-        try{
-          fr=await fetch(virtualUrl,{cache:'no-store'});
-          if(fr.ok){ fetchOk++; }
-          else if(!firstFailure) firstFailure={name,stage:'SW FETCH',detail:`HTTP ${fr.status} · type=${fr.type}`};
-        }catch(e){ if(!firstFailure) firstFailure={name,stage:'SW FETCH',detail:String(e && e.message || e)}; }
-        const ir=await waitForImage(virtualUrl);
-        if(ir.ok){ imgOk++; if(!sampleSuccess) sampleSuccess={name,detail:ir.detail}; }
-        else if(!firstFailure) firstFailure={name,stage:'IMG',detail:ir.detail};
-        // Esimese 5 cache-kirje tegelik renderdamine on piisav, et telefonis SW/Response probleem tuvastada.
-        if(cached>=5 && (firstFailure || imgOk>=5)) break;
-      }
-      lines.push(`Kaardistatud: ${mapped} / ${names.length}`);
-      lines.push(`Cache'ist leitud (kontrollitud osa): ${cached}`);
-      lines.push(`Virtuaal-URL fetch OK: ${fetchOk}`);
-      lines.push(`<img> render OK: ${imgOk}`);
-      if(sampleSuccess) lines.push(`Näidis OK: ${sampleSuccess.name} · ${sampleSuccess.detail}`);
-      if(firstFailure){
-        lines.push(''); lines.push('ESIMENE VIGA');
-        lines.push(`Fail: ${firstFailure.name}`);
-        lines.push(`Etapp: ${firstFailure.stage}`);
-        lines.push(`Detail: ${firstFailure.detail}`);
-        const info=map[offlineMapKey(firstFailure.name)] || map[firstFailure.name];
-        if(info){
-          lines.push(`Commons URL: ${info.url || '(puudub)'}`);
-          lines.push(`Offline URL: ${info.offlineUrl || offlineImageUrl(firstFailure.name)}`);
-          const hit=await cache.match(info.offlineUrl || offlineImageUrl(firstFailure.name),{ignoreVary:true});
-          if(hit) lines.push(`Cached Response: type=${hit.type} status=${hit.status} ok=${hit.ok}`);
+      lines.push(`CACHE'ID: ${keys.length ? keys.join(', ') : '(puuduvad)'}`);
+
+      const reg = await navigator.serviceWorker.ready;
+      const sw = navigator.serviceWorker.controller || reg.active;
+      if(!sw){
+        lines.push('SW WHOAMI: aktiivne Service Worker puudub');
+      }else{
+        const ch = new MessageChannel();
+        const reply = new Promise(resolve => {
+          const timer = setTimeout(() => resolve({error:'timeout'}), 4000);
+          ch.port1.onmessage = event => { clearTimeout(timer); resolve(event.data || {}); };
+        });
+        sw.postMessage('whoami', [ch.port2]);
+        const info = await reply;
+        if(info && !info.error){
+          lines.push(`SW VERSION: ${info.SW_VERSION || '(puudub)'}`);
+          lines.push(`SW CACHE_NAME: ${info.CACHE_NAME || '(puudub)'}`);
+          lines.push(`CACHE NIMED ÜHTIVAD: ${info.CACHE_NAME === OFFLINE_CACHE_NAME ? 'JAH' : 'EI'}`);
+        }else{
+          lines.push('SW WHOAMI: vastust ei tulnud 4 sekundi jooksul');
+          lines.push('See viitab tõenäoliselt sellele, et aktiivne SW on vanem versioon, milles whoami handler puudub.');
         }
-      }else if(mapped===names.length && cached>0 && imgOk>0){ lines.push(''); lines.push('Diagnostika kontrollitud osas viga ei leidnud.'); }
-    }catch(e){ lines.push('DIAGNOSTIKA VIGA: '+String(e && e.stack || e)); }
-    diagOut.textContent=lines.join('\n');
-    diagBtn.disabled=false;
-  }
-
-
-  function auditFollowTitle(title, links){
-    let cur = title;
-    const seen = new Set();
-    for(let i=0;i<10;i++){
-      const key = cur.toLowerCase();
-      if(seen.has(key)) break;
-      seen.add(key);
-      const next = links.get(key);
-      if(!next) break;
-      cur = next;
-    }
-    return cur;
-  }
-
-  async function decodeBlob(blob, timeoutMs=10000){
-    const u = URL.createObjectURL(blob);
-    try{ return await waitForImage(u, timeoutMs); }
-    finally{ URL.revokeObjectURL(u); }
-  }
-
-  async function auditCommonsBatch(batch){
-    const titles = batch.map(name => 'File:' + normalizeFilename(name));
-    const api = 'https://commons.wikimedia.org/w/api.php?action=query'
-      + '&titles=' + encodeURIComponent(titles.join('|'))
-      + '&redirects=1&prop=imageinfo&iiprop=url|size|mime|canonicaltitle&iiurlwidth=1400&format=json&origin=*';
-    const r = await fetch(api, {cache:'no-store'});
-    if(!r.ok) throw new Error('API HTTP ' + r.status);
-    const data = await r.json();
-    const q = data.query || {};
-    const links = new Map();
-    const normalized = q.normalized || [];
-    const redirects = q.redirects || [];
-    for(const n of normalized) links.set(String(n.from||'').toLowerCase(), String(n.to||''));
-    for(const rd of redirects) links.set(String(rd.from||'').toLowerCase(), String(rd.to||''));
-    const pagesByTitle = new Map();
-    for(const page of Object.values(q.pages || {})) pagesByTitle.set(String(page.title||'').toLowerCase(), page);
-    const results=[];
-    for(const originalName of batch){
-      const requestedTitle = 'File:' + normalizeFilename(originalName);
-      const finalTitle = auditFollowTitle(requestedTitle, links);
-      const page = pagesByTitle.get(finalTitle.toLowerCase());
-      const norm = normalized.find(x => String(x.from||'').toLowerCase() === requestedTitle.toLowerCase());
-      let redirFrom = norm ? String(norm.to||'') : requestedTitle;
-      const redirectChain=[];
-      const seen=new Set();
-      for(let i=0;i<10;i++){
-        const rd = redirects.find(x => String(x.from||'').toLowerCase() === redirFrom.toLowerCase());
-        if(!rd || seen.has(String(rd.from).toLowerCase())) break;
-        seen.add(String(rd.from).toLowerCase()); redirectChain.push(`${rd.from} → ${rd.to}`); redirFrom=String(rd.to||'');
       }
-      const ii = page && page.imageinfo && page.imageinfo[0];
-      results.push({
-        originalName,
-        requestedTitle,
-        normalizedTo: norm ? String(norm.to||'') : '',
-        redirectChain,
-        finalTitle: page ? String(page.title||'') : finalTitle,
-        found: !!(page && page.missing === undefined && ii),
-        mime: ii && ii.mime || '',
-        width: ii && ii.width || 0,
-        height: ii && ii.height || 0,
-        size: ii && ii.size || 0,
-        url: ii && (ii.thumburl || ii.url) || '',
-        originalUrl: ii && ii.url || ''
-      });
+    }catch(err){
+      lines.push(`VIGA: ${err && err.message ? err.message : String(err)}`);
+    }finally{
+      diagOut.textContent = lines.join('\n');
+      diagBtn.disabled = false;
     }
-    return results;
   }
 
   async function runCommonsAudit(){
