@@ -1,4 +1,4 @@
-const CACHE_NAME = 'tehnikatuvastus-offline-v7';
+const CACHE_NAME = 'tehnikatuvastus-offline-v8';
 const CORE_ASSETS = [
   './', './index.html', './manifest.json', './icon-192.png', './icon-512.png',
   './apple-touch-icon.png', './offline-sw.js', './offline-assets.json'
@@ -21,12 +21,22 @@ self.addEventListener('activate', event => {
 self.addEventListener('fetch', event => {
   if(event.request.method !== 'GET') return;
   event.respondWith((async () => {
+    const url = new URL(event.request.url);
+
+    // Commonsi offline-pildid kasutavad ainult sama päritolu virtuaalset URL-i.
+    // Seda rada EI TOHI kunagi võrku edasi saata: vastus peab tulema cache'ist.
+    if(url.origin === self.location.origin && url.pathname.includes('/__offline_image__/')){
+      const offlineCache = await caches.open(CACHE_NAME);
+      const offlineImage = await offlineCache.match(event.request, {ignoreVary:true});
+      if(offlineImage) return offlineImage;
+      return new Response('', {status: 404, statusText: 'Offline image not cached'});
+    }
+
     const cached = await caches.match(event.request, {ignoreVary:true});
     if(cached) return cached;
     try{
       const response = await fetch(event.request);
       // Sama päritolu ressursid võib jooksvalt cache'ida; Commonsi täispaketti haldab äpi nupp.
-      const url = new URL(event.request.url);
       if(response && response.ok && url.origin === self.location.origin){
         const cache = await caches.open(CACHE_NAME);
         cache.put(event.request, response.clone());
