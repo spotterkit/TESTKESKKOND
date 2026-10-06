@@ -1349,16 +1349,18 @@ function stripHtml(html){
 // Kui failinimi kopeeriti kogemata thumbnail-URL kujul (sisaldab "/960px-..." vms)
 // või URL-kodeeritud kujul (%27, %2C jms), parandatakse see siin automaatselt.
 function normalizeFilename(raw){
-  let f = raw.trim();
+  let f = String(raw || '').trim();
   const slashIdx = f.indexOf('/');
   if(slashIdx !== -1) f = f.substring(0, slashIdx);
   if(/%[0-9A-Fa-f]{2}/.test(f)){
     try{ f = decodeURIComponent(f); }catch(e){ /* jäta muutmata */ }
   }
-  return f;
+  // Commons käsitleb pealkirjades alakriipsu tühikuna. Offline-kaardi võtmed
+  // peavad olema samad sõltumata sellest, kas API tagastab "A_B.jpg" või "A B.jpg".
+  return f.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-const OFFLINE_CACHE_NAME = 'tehnikatuvastus-offline-v4';
+const OFFLINE_CACHE_NAME = 'tehnikatuvastus-offline-v5';
 const OFFLINE_MAP_KEY = './__offline_commons_map__.json';
 let offlineCommonsMapMemo = null;
 
@@ -2549,7 +2551,7 @@ showHomeScreen();
     for(const page of pages){
       const ii = page && page.imageinfo && page.imageinfo[0];
       if(!page || page.missing !== undefined || !ii || !ii.mime || !ii.mime.startsWith('image/')) continue;
-      const raw = String(page.title || '').replace(/^File:/i,'').replace(/ /g,'_');
+      const raw = String(page.title || '').replace(/^File:/i,'');
       const name = normalizeFilename(raw);
       const ext = ii.extmetadata || {};
       map[name] = {
