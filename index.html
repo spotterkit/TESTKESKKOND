@@ -568,8 +568,8 @@
         <div class="row" style="margin-top:8px;">
           <button id="offlineDeleteBtn" type="button" style="flex:1; display:none;">Kustuta offline andmed</button>
         </div>
-        <div class="row" style="margin-top:8px;">
-          <button id="offlineDiagBtn" type="button" class="primary" style="flex:1; display:block;">Täielik offline kontroll</button>
+        <div class="row" style="display:none; margin-top:8px;">
+          <button id="offlineDiagBtn" type="button" class="primary" style="display:none;">Täielik offline kontroll</button>
           <button id="commonsAuditBtn" type="button" style="display:none;">Auditeeri Commonsi pilte</button>
           <button id="roundTripAuditBtn" type="button" style="display:none;">Auditeeri cache round-trip</button>
         </div>
@@ -1431,9 +1431,13 @@ async function fetchSpecificFile(filename){
   }
 
   const normalizedName = normalizeFilename(filename);
-  if(!navigator.onLine){
-    const offlineEntry = await getOfflineCommonsEntry(normalizedName);
-    if(offlineEntry) return {...offlineEntry, filename: cleanTitle('File:' + normalizedName), rawTitle: 'File:' + normalizedName, isOffline: true};
+
+  // OFFLINE-FIRST: kui Commonsi pilt on juba seadmesse paigaldatud, kasuta
+  // seda kohe nii online- kui offline-režiimis. See väldib olukorda, kus
+  // brauser ootab enne Commons API võrgu-timeouti ja alles siis kuvab cache'i.
+  const installedOfflineEntry = await getOfflineCommonsEntry(normalizedName);
+  if(installedOfflineEntry){
+    return {...installedOfflineEntry, filename: cleanTitle('File:' + normalizedName), rawTitle: 'File:' + normalizedName, isOffline: true};
   }
 
   const title = 'File:' + normalizedName;
