@@ -537,6 +537,18 @@
   .model-gallery-imgwrap img{width:100%;height:100%;object-fit:contain;display:block;}
   .model-gallery-state{padding:16px;color:var(--bone-dim);font-size:11px;text-align:center;}
   .model-gallery-file{padding:8px 10px;font-size:10px;color:var(--bone-dim);word-break:break-word;border-top:1px solid var(--line);}
+  .model-gallery-imgwrap img{cursor:zoom-in;}
+  /* Pildi suurendus (lightbox) */
+  .lightbox{display:none;position:fixed;inset:0;z-index:10000;background:rgba(5,6,3,.96);flex-direction:column;}
+  .lightbox.open{display:flex;}
+  .lightbox-bar{display:flex;align-items:center;gap:6px;padding:8px 10px;border-bottom:1px solid var(--line);flex-wrap:wrap;}
+  .lightbox-bar button{min-width:44px;min-height:44px;font-size:18px;}
+  .lightbox-info{flex:1;min-width:120px;font-size:11px;color:var(--bone-dim);word-break:break-word;}
+  .lightbox-stage{position:relative;flex:1;overflow:hidden;touch-action:none;cursor:grab;user-select:none;-webkit-user-select:none;}
+  .lightbox-stage.dragging{cursor:grabbing;}
+  .lightbox-stage img{position:absolute;left:0;top:0;max-width:none;max-height:none;transform-origin:0 0;will-change:transform;-webkit-user-drag:none;visibility:hidden;}
+  .lightbox-stage img.ready{visibility:visible;}
+  .lightbox-msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--bone-dim);font-size:13px;pointer-events:none;}
   @media(max-width:600px){.model-gallery{inset:2vh 2vw;padding:12px}.model-gallery-grid{grid-template-columns:1fr}.model-gallery-imgwrap{height:240px}}
 
   /* Õppesessiooni progress ja lõpuülevaade */
@@ -559,6 +571,11 @@
 </style>
 </head>
 <body>
+<script>
+/* Varajane skriptivigade loendur: shell loetakse "terveks" ainult siis, kui käivitusel ühtegi skriptiviga ei tulnud. */
+window.__bootErrors = 0;
+window.addEventListener('error', function(){ window.__bootErrors++; });
+</script>
 <div class="wrap">
 
   <header>
@@ -663,6 +680,22 @@
       <button type="button" id="modelGalleryClose">Sulge</button>
     </div>
     <div class="model-gallery-grid" id="modelGalleryGrid"></div>
+  </div>
+
+  <div id="lightbox" class="lightbox" role="dialog" aria-modal="true" aria-label="Pildi suurendus" aria-hidden="true">
+    <div class="lightbox-bar">
+      <button type="button" id="lbPrev" aria-label="Eelmine pilt" title="Eelmine (←)">‹</button>
+      <button type="button" id="lbNext" aria-label="Järgmine pilt" title="Järgmine (→)">›</button>
+      <button type="button" id="lbOut" aria-label="Vähenda" title="Vähenda (-)">−</button>
+      <button type="button" id="lbIn" aria-label="Suurenda" title="Suurenda (+)">+</button>
+      <button type="button" id="lbFit" aria-label="Sobita ekraanile" title="Sobita (0)">⤢</button>
+      <div class="lightbox-info" id="lbInfo"></div>
+      <button type="button" id="lbClose" aria-label="Sulge" title="Sulge (Esc)">✕</button>
+    </div>
+    <div class="lightbox-stage" id="lbStage">
+      <img id="lbImg" alt="" draggable="false">
+      <div class="lightbox-msg" id="lbMsg"></div>
+    </div>
   </div>
 
   <div id="kuldScreen" style="display:none;">
@@ -2098,6 +2131,14 @@ async function openModelGallery(entry){
       if(!info || !info.url) throw new Error('Pildi URL-i ei saadud');
       const img = document.createElement('img');
       img.alt = entry.label;
+      img.tabIndex = 0;
+      img.setAttribute('role', 'button');
+      img.setAttribute('aria-label', 'Suurenda: ' + sourceFilename);
+      img.dataset.caption = sourceFilename;
+      img.addEventListener('click', () => openLightbox(img));
+      img.addEventListener('keydown', ev => {
+        if(ev.key === 'Enter' || ev.key === ' '){ ev.preventDefault(); openLightbox(img); }
+      });
       img.onload = () => { state.remove(); };
       img.onerror = () => { state.textContent = 'Pildi laadimine ebaõnnestus'; img.remove(); };
       wrap.appendChild(img);
@@ -2109,10 +2150,218 @@ async function openModelGallery(entry){
 }
 
 function closeModelGallery(){
+  if(lbOpen) closeLightbox(false);
   modelGallery.classList.remove('open');
   modelGallery.setAttribute('aria-hidden','true');
   modelGalleryGrid.innerHTML = '';
 }
+
+// ============================================================================
+// PILDI SUURENDUS (lightbox). Kasutab TÄPSELT sama src-i, mille galerii juba laadis
+// (img.currentSrc): ei tee uut fetchSpecificFile kutset, API-päringut ega küsi teist suurust.
+// Hiirerullik/pinch suurendab, lohistamine liigutab, topeltklõps/-puude vahetab sobita ↔ suurendus.
+// Klahvid: Esc sulgeb, + / - suurendab/vähendab, 0 sobitab, ← → vahetab pilti, Home/End.
+// ============================================================================
+const lightbox = document.getElementById('lightbox');
+const lbStage = document.getElementById('lbStage');
+const lbImg = document.getElementById('lbImg');
+const lbMsg = document.getElementById('lbMsg');
+const lbInfo = document.getElementById('lbInfo');
+let lbOpen = false, lbItems = [], lbIndex = 0, lbOpener = null;
+let lbScale = 1, lbFit = 1, lbX = 0, lbY = 0;
+const lbPointers = new Map();
+let lbPinch = null, lbLastTap = null, lbMoved = false;
+
+function lbMaxScale(){ return Math.max(lbFit * 8, 4); }
+function lbApply(){
+  lbImg.style.transform = 'translate(' + lbX + 'px,' + lbY + 'px) scale(' + lbScale + ')';
+}
+function lbClamp(){
+  const sw = lbStage.clientWidth, sh = lbStage.clientHeight;
+  const iw = lbImg.naturalWidth * lbScale, ih = lbImg.naturalHeight * lbScale;
+  lbX = iw <= sw ? (sw - iw) / 2 : Math.min(0, Math.max(sw - iw, lbX));
+  lbY = ih <= sh ? (sh - ih) / 2 : Math.min(0, Math.max(sh - ih, lbY));
+}
+function lbSetFit(){
+  const sw = lbStage.clientWidth, sh = lbStage.clientHeight;
+  if(!lbImg.naturalWidth || !sw || !sh) return;
+  lbFit = Math.min(sw / lbImg.naturalWidth, sh / lbImg.naturalHeight);
+  lbScale = lbFit; lbX = 0; lbY = 0;
+  lbClamp(); lbApply();
+}
+// Suurenda/vähenda skaalani s2 nii, et punkt (px, py) stage'i koordinaatides jääb paigale.
+function lbZoomTo(s2, px, py){
+  s2 = Math.min(lbMaxScale(), Math.max(lbFit, s2));
+  const k = s2 / lbScale;
+  lbX = px - (px - lbX) * k;
+  lbY = py - (py - lbY) * k;
+  lbScale = s2;
+  lbClamp(); lbApply();
+}
+function lbZoomBy(factor){
+  lbZoomTo(lbScale * factor, lbStage.clientWidth / 2, lbStage.clientHeight / 2);
+}
+function lbToggleZoom(px, py){
+  const atFit = lbScale <= lbFit * 1.02;
+  const target = atFit ? Math.max(1, lbFit * 2.5) : lbFit;
+  lbZoomTo(target, px, py);
+}
+function lbShow(i){
+  if(!lbItems.length) return;
+  lbIndex = (i + lbItems.length) % lbItems.length;
+  const item = lbItems[lbIndex];
+  lbImg.classList.remove('ready');
+  lbMsg.textContent = 'Laen pilti...';
+  lbInfo.textContent = (lbIndex + 1) + ' / ' + lbItems.length + ' · ' + item.caption;
+  lbImg.alt = item.alt;
+  lbImg.onload = () => { lbMsg.textContent = ''; lbSetFit(); lbImg.classList.add('ready'); };
+  lbImg.onerror = () => { lbMsg.textContent = 'Pildi laadimine ebaõnnestus'; };
+  lbImg.src = item.src;
+  document.getElementById('lbPrev').disabled = document.getElementById('lbNext').disabled = lbItems.length < 2;
+}
+function openLightbox(clickedImg){
+  lbItems = Array.from(modelGalleryGrid.querySelectorAll('img'))
+    .filter(im => im.complete && im.naturalWidth > 0 && (im.currentSrc || im.src))
+    .map(im => ({src: im.currentSrc || im.src, alt: im.alt, caption: im.dataset.caption || '', el: im}));
+  const idx = lbItems.findIndex(it => it.el === clickedImg);
+  if(idx < 0) return;
+  lbOpener = clickedImg;
+  lbOpen = true;
+  lightbox.classList.add('open');
+  lightbox.setAttribute('aria-hidden', 'false');
+  document.body.style.overflow = 'hidden';
+  lbShow(idx);
+  document.getElementById('lbClose').focus();
+}
+function closeLightbox(restoreFocus){
+  if(!lbOpen) return;
+  lbOpen = false;
+  lbPointers.clear(); lbPinch = null; lbLastTap = null;
+  lightbox.classList.remove('open');
+  lightbox.setAttribute('aria-hidden', 'true');
+  document.body.style.overflow = '';
+  lbImg.onload = lbImg.onerror = null;
+  lbImg.removeAttribute('src');
+  lbImg.classList.remove('ready');
+  if(restoreFocus !== false && lbOpener && document.contains(lbOpener)){ try{ lbOpener.focus(); }catch(e){} }
+  lbOpener = null;
+}
+
+document.getElementById('lbClose').addEventListener('click', () => closeLightbox());
+document.getElementById('lbPrev').addEventListener('click', () => lbShow(lbIndex - 1));
+document.getElementById('lbNext').addEventListener('click', () => lbShow(lbIndex + 1));
+document.getElementById('lbIn').addEventListener('click', () => lbZoomBy(1.4));
+document.getElementById('lbOut').addEventListener('click', () => lbZoomBy(1 / 1.4));
+document.getElementById('lbFit').addEventListener('click', lbSetFit);
+
+lbStage.addEventListener('wheel', ev => {
+  ev.preventDefault();
+  const r = lbStage.getBoundingClientRect();
+  const dy = ev.deltaMode === 1 ? ev.deltaY * 16 : ev.deltaY;
+  lbZoomTo(lbScale * Math.exp(-dy * (ev.ctrlKey ? 0.01 : 0.0015)), ev.clientX - r.left, ev.clientY - r.top);
+}, {passive:false});
+
+function lbDist(){ const p = Array.from(lbPointers.values()); return Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y); }
+function lbMid(){ const p = Array.from(lbPointers.values()); return {x:(p[0].x + p[1].x) / 2, y:(p[0].y + p[1].y) / 2}; }
+
+lbStage.addEventListener('pointerdown', ev => {
+  try{ lbStage.setPointerCapture(ev.pointerId); }catch(e){}
+  const r = lbStage.getBoundingClientRect();
+  lbPointers.set(ev.pointerId, {x:ev.clientX - r.left, y:ev.clientY - r.top, sx:ev.clientX, sy:ev.clientY});
+  lbMoved = false;
+  lbStage.classList.add('dragging');
+  if(lbPointers.size === 2){
+    const m = lbMid();
+    lbPinch = {d:lbDist(), scale:lbScale, mx:m.x, my:m.y};
+    lbLastTap = null;
+  }
+});
+lbStage.addEventListener('pointermove', ev => {
+  const p = lbPointers.get(ev.pointerId);
+  if(!p) return;
+  const r = lbStage.getBoundingClientRect();
+  const nx = ev.clientX - r.left, ny = ev.clientY - r.top;
+  if(Math.hypot(ev.clientX - p.sx, ev.clientY - p.sy) > 6) lbMoved = true;
+  if(lbPointers.size === 2 && lbPinch){
+    p.x = nx; p.y = ny;
+    const m = lbMid();
+    // pinch: skaala järgi + keskpunkti liikumine
+    lbX += m.x - lbPinch.mx; lbY += m.y - lbPinch.my;
+    lbPinch.mx = m.x; lbPinch.my = m.y;
+    lbZoomTo(lbPinch.scale * (lbDist() / lbPinch.d), m.x, m.y);
+  }else if(lbPointers.size === 1){
+    lbX += nx - p.x; lbY += ny - p.y;
+    p.x = nx; p.y = ny;
+    lbClamp(); lbApply();
+  }
+});
+function lbPointerEnd(ev){
+  const p = lbPointers.get(ev.pointerId);
+  if(!p) return;
+  lbPointers.delete(ev.pointerId);
+  if(lbPointers.size < 2) lbPinch = null;
+  if(!lbPointers.size) lbStage.classList.remove('dragging');
+  if(ev.type === 'pointerup' && !lbMoved && lbPointers.size === 0){
+    const now = Date.now();
+    if(lbLastTap && now - lbLastTap.t < 320 && Math.hypot(p.x - lbLastTap.x, p.y - lbLastTap.y) < 30){
+      lbToggleZoom(p.x, p.y);
+      lbLastTap = null;
+    }else{
+      lbLastTap = {t:now, x:p.x, y:p.y};
+    }
+  }
+}
+lbStage.addEventListener('pointerup', lbPointerEnd);
+lbStage.addEventListener('pointercancel', lbPointerEnd);
+window.addEventListener('resize', () => { if(lbOpen && lbImg.naturalWidth){ const atFit = lbScale <= lbFit * 1.02; const old = lbScale; lbSetFit(); if(!atFit) lbZoomTo(old, lbStage.clientWidth/2, lbStage.clientHeight/2); } });
+
+// Esc ja klaviatuur: Esc sulgeb alati KÕIGE ÜLEMISE kihi, ühe sammu korraga
+// (lightbox → galerii → otsinguvälja tühjendus → väljalt lahkumine). Test, harjutus, Kuldvillak
+// ja offline-install ei reageeri Esc-ile. Registreeritud enne teisi keydown-kuulajaid.
+document.addEventListener('keydown', ev => {
+  if(lbOpen){
+    const k = ev.key;
+    let handled = true;
+    if(k === 'Escape') closeLightbox();
+    else if(k === '+' || k === '=') lbZoomBy(1.4);
+    else if(k === '-' || k === '_') lbZoomBy(1 / 1.4);
+    else if(k === '0') lbSetFit();
+    else if(k === 'ArrowLeft') lbShow(lbIndex - 1);
+    else if(k === 'ArrowRight') lbShow(lbIndex + 1);
+    else if(k === 'Home') lbShow(0);
+    else if(k === 'End') lbShow(lbItems.length - 1);
+    else if(k === 'Tab'){
+      // fookuse lukustus lightboxi nuppudesse
+      const f = Array.from(lightbox.querySelectorAll('button:not([disabled])'));
+      if(f.length){
+        const first = f[0], last = f[f.length - 1];
+        if(ev.shiftKey && document.activeElement === first){ ev.preventDefault(); last.focus(); }
+        else if(!ev.shiftKey && document.activeElement === last){ ev.preventDefault(); first.focus(); }
+        else if(!lightbox.contains(document.activeElement)){ ev.preventDefault(); first.focus(); }
+      }
+      handled = false;
+    }
+    else handled = false;
+    if(handled){ ev.preventDefault(); ev.stopImmediatePropagation(); }
+    return;
+  }
+  if(ev.key !== 'Escape') return;
+  if(modelGallery.classList.contains('open')){
+    closeModelGallery();
+    ev.preventDefault(); ev.stopImmediatePropagation();
+    return;
+  }
+  const search = document.getElementById('modelListSearch');
+  if(search && document.activeElement === search){
+    if(search.value){
+      search.value = '';
+      renderModelList('');
+    }else{
+      search.blur();
+    }
+    ev.preventDefault(); ev.stopImmediatePropagation();
+  }
+});
 
 // ============================================================================
 // QR-KOOD — avalehe paremal pool (peidus kitsal ekraanil). Genereeritakse
@@ -2603,8 +2852,44 @@ showHomeScreen();
   const hadController = !!navigator.serviceWorker.controller;
   let controllerReloaded = false;
   let swRegistration = null;
-  const APP_BUILD = 'rc4'; // tõsta iga release'iga; kuvatakse oleku real, et näha, millist versiooni seade käitab
+  const APP_BUILD = 'rc5'; // tõsta iga release'iga koos SW_VERSION-iga ('offline-' + APP_BUILD); kuvatakse oleku real
   let pendingReload = false;
+  let pendingReloadBuild = null;
+
+  // Last-known-good shell: kui leht käivitus ilma skriptivigadeta, teata SW-le, et see build on terve.
+  // Alles siis muutub see offline-fallbackiks. Vigane leht ei saada midagi ja offline jääb vana terve koopia.
+  function pageLooksHealthy(){
+    try{
+      return !window.__bootErrors
+        && typeof CATEGORIES !== 'undefined' && Array.isArray(CATEGORIES) && CATEGORIES.length > 0
+        && typeof fetchSpecificFile === 'function'
+        && typeof renderHome === 'function'
+        && !!document.getElementById('modelGallery') && !!document.getElementById('lightbox');
+    }catch(e){ return false; }
+  }
+  async function reportHealthy(){
+    if(!pageLooksHealthy()) return;
+    try{
+      const reg = await navigator.serviceWorker.ready;
+      const target = navigator.serviceWorker.controller || reg.active;
+      if(target) target.postMessage({type:'shell-healthy', build:APP_BUILD});
+    }catch(e){}
+  }
+  function scheduleHealthReport(){
+    // ~3 s pärast käivitust: hilisemad käivitusvead jõuavad veel __bootErrors-i.
+    setTimeout(reportHealthy, 3000);
+  }
+  // Uuendusest teavitamine on ühekordne iga build'i kohta ühes tabis (sessionStorage): vigane või aeglane
+  // uus leht ei saa tekitada reload-silmust.
+  function reloadForBuild(build){
+    try{
+      if(sessionStorage.getItem('tvReloadedFor') === build) return false;
+      sessionStorage.setItem('tvReloadedFor', build);
+    }catch(e){ /* sessionStorage pole saadaval: kaitseb controllerReloaded lipp selle lehe eluea jooksul */ }
+    controllerReloaded = true;
+    location.reload();
+    return true;
+  }
   let wakeLock = null;
   async function acquireWakeLock(){
     try{ if('wakeLock' in navigator && document.visibilityState==='visible') wakeLock = await navigator.wakeLock.request('screen'); }
@@ -2720,14 +3005,18 @@ showHomeScreen();
 
   // SW teatab, kui ta serveeris aeglase võrgu tõttu vana lehte ja leidis taustal uue.
   navigator.serviceWorker.addEventListener('message', e => {
-    if(e.data && e.data.type === 'shell-updated') pendingReload = true;
+    const d = e.data;
+    if(d && d.type === 'shell-updated' && d.build && d.build !== APP_BUILD){
+      pendingReload = true; pendingReloadBuild = d.build;
+    }
   });
   setInterval(() => {
-    if(pendingReload && hadController && !controllerReloaded && isHomeIdle()){
-      controllerReloaded = true;
-      location.reload();
+    if(pendingReload && pendingReloadBuild && hadController && !controllerReloaded && isHomeIdle()){
+      pendingReload = false;
+      reloadForBuild(pendingReloadBuild);
     }
   }, 2000);
+  scheduleHealthReport();
 
   navigator.serviceWorker.register('./offline-sw.js', {updateViaCache:'none'}).then(async reg => {
     swRegistration=reg;
