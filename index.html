@@ -439,6 +439,11 @@
     font-size:10px;color:var(--bone-dim);
     margin-top:12px;line-height:1.6;
   }
+  .qr-panel .qr-help{
+    font-size:9px;color:var(--bone-dim);opacity:.8;
+    margin-top:10px;padding-top:10px;border-top:1px solid var(--line);
+    line-height:1.6;text-align:left;
+  }
   @media(max-width:760px){
     .qr-panel{display:none;}
   }
@@ -653,6 +658,10 @@ window.addEventListener('error', function(){ window.__bootErrors++; });
         <div class="qr-eyebrow">Ava telefonis</div>
         <div class="qr-box" id="qrBox"></div>
         <div class="qr-caption">Skanni QR-kood, et avada see leht oma seadmes.</div>
+        <div class="qr-help">Telefoni avaekraanile lisamine:<br>
+          <b>iPhone (Safari):</b> jagamisnupp → Lisa avaekraanile.<br>
+          <b>Android (Chrome):</b> ⋮ menüü → Paigalda äpp / Lisa avaekraanile.<br>
+          Ava äpp ikoonilt ja laadi offline-pakett SEAL (avaekraani äpil on oma salvestus).</div>
       </div>
     </div>
   </div>
@@ -813,7 +822,7 @@ window.addEventListener('error', function(){ window.__bootErrors++; });
   </div>
 
 
-  <footer>Pildid: Wikimedia Commons · Vene Föderatsiooni sõjatehnika</footer>
+  <footer>Pildid: Wikimedia Commons<br><span id="appBuildLabel" style="opacity:.6;">versioon …</span></footer>
 </div>
 
 <!-- Vendored QR-koodi generaator (MIT litsents, autor Kazuhiko Arase).
@@ -2106,6 +2115,8 @@ if(modelListSearch){
 }
 
 async function openModelGallery(entry){
+  const galleryWasOpen = modelGallery.classList.contains('open');
+  if(!galleryWasOpen) pushLayer();
   modelGalleryTitle.textContent = entry.label + ' · ' + entry.files.length + (entry.files.length === 1 ? ' pilt' : ' pilti');
   modelGalleryGrid.innerHTML = '';
   modelGallery.classList.add('open');
@@ -2149,8 +2160,10 @@ async function openModelGallery(entry){
   });
 }
 
-function closeModelGallery(){
-  if(lbOpen) closeLightbox(false);
+function closeModelGallery(fromHistory){
+  const wasOpen = modelGallery.classList.contains('open');
+  if(lbOpen) closeLightbox(false, fromHistory === true);
+  if(wasOpen && fromHistory !== true) popLayer();
   modelGallery.classList.remove('open');
   modelGallery.setAttribute('aria-hidden','true');
   modelGalleryGrid.innerHTML = '';
@@ -2162,6 +2175,25 @@ function closeModelGallery(){
 // Hiirerullik/pinch suurendab, lohistamine liigutab, topeltklõps/-puude vahetab sobita ↔ suurendus.
 // Klahvid: Esc sulgeb, + / - suurendab/vähendab, 0 sobitab, ← → vahetab pilti, Home/End.
 // ============================================================================
+// Telefoni tagasi-nupp: iga avatud kiht (galerii, lightbox) lisab ühe history kirje; tagasi-nupp sulgeb
+// ülemise kihi. UI kaudu sulgemisel eemaldatakse kirje history.back()-iga (popstate seda ignoreerib).
+let layerDepth = 0, ignorePops = 0;
+function pushLayer(){
+  try{ history.pushState({tvLayer:true}, ''); layerDepth++; }catch(e){}
+}
+function popLayer(){
+  if(layerDepth <= 0) return;
+  layerDepth--; ignorePops++;
+  try{ history.back(); }catch(e){ ignorePops--; }
+}
+window.addEventListener('popstate', () => {
+  if(ignorePops > 0){ ignorePops--; return; }
+  if(layerDepth <= 0) return;
+  layerDepth--;
+  if(lbOpen) closeLightbox(true, true);
+  else if(modelGallery.classList.contains('open')) closeModelGallery(true);
+});
+
 const lightbox = document.getElementById('lightbox');
 const lbStage = document.getElementById('lbStage');
 const lbImg = document.getElementById('lbImg');
@@ -2227,15 +2259,17 @@ function openLightbox(clickedImg){
   if(idx < 0) return;
   lbOpener = clickedImg;
   lbOpen = true;
+  pushLayer();
   lightbox.classList.add('open');
   lightbox.setAttribute('aria-hidden', 'false');
   document.body.style.overflow = 'hidden';
   lbShow(idx);
   document.getElementById('lbClose').focus();
 }
-function closeLightbox(restoreFocus){
+function closeLightbox(restoreFocus, fromHistory){
   if(!lbOpen) return;
   lbOpen = false;
+  if(fromHistory !== true) popLayer();
   lbPointers.clear(); lbPinch = null; lbLastTap = null;
   lightbox.classList.remove('open');
   lightbox.setAttribute('aria-hidden', 'true');
@@ -2765,7 +2799,7 @@ kuldResetBtn.addEventListener('click', resetKuldvillak);
 startCatalogBtn.addEventListener('click', startCatalog);
 showModelListBtn.addEventListener('click', showListScreen);
 listBackBtn.addEventListener('click', goHome);
-modelGalleryClose.addEventListener('click', closeModelGallery);
+modelGalleryClose.addEventListener('click', () => closeModelGallery());
 modelGallery.addEventListener('click', e => { if(e.target === modelGallery) closeModelGallery(); });
 
 guessInput.addEventListener('input', () => {
@@ -2852,7 +2886,10 @@ showHomeScreen();
   const hadController = !!navigator.serviceWorker.controller;
   let controllerReloaded = false;
   let swRegistration = null;
-  const APP_BUILD = 'rc5'; // tõsta iga release'iga koos SW_VERSION-iga ('offline-' + APP_BUILD); kuvatakse oleku real
+  const APP_BUILD = 'rc6'; // tõsta iga release'iga koos SW_VERSION-iga ('offline-' + APP_BUILD); kuvatakse oleku real
+  // Jaluse versioonirida: näitab, millist lehte brauser PRAEGU käitab (ka enne offline-paketi laadimist).
+  const buildLabel = document.getElementById('appBuildLabel');
+  if(buildLabel) buildLabel.textContent = 'versioon ' + APP_BUILD;
   let pendingReload = false;
   let pendingReloadBuild = null;
 
