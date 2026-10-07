@@ -2603,6 +2603,17 @@ showHomeScreen();
   const hadController = !!navigator.serviceWorker.controller;
   let controllerReloaded = false;
   let swRegistration = null;
+  const APP_BUILD = 'rc4'; // tõsta iga release'iga; kuvatakse oleku real, et näha, millist versiooni seade käitab
+  let pendingReload = false;
+  let wakeLock = null;
+  async function acquireWakeLock(){
+    try{ if('wakeLock' in navigator && document.visibilityState==='visible') wakeLock = await navigator.wakeLock.request('screen'); }
+    catch(e){ wakeLock = null; }
+  }
+  function releaseWakeLock(){
+    try{ if(wakeLock) wakeLock.release(); }catch(e){}
+    wakeLock = null;
+  }
 
   if(!('serviceWorker' in navigator) || !('caches' in window)){
     btn.disabled = true;
@@ -2695,15 +2706,28 @@ showHomeScreen();
     }else{
       btn.textContent='Lae äpp offline kasutuseks'; delBtn.style.display='none'; status.textContent='Offline-versiooni pole veel seadmesse laaditud.';
     }
+    status.textContent += ' · versioon ' + APP_BUILD;
   }
 
   navigator.serviceWorker.addEventListener('controllerchange', () => {
     // Ära katkesta installi, testi ega Kuldvillakut. Kui leht avanes ilma kontrollerita,
     // ei ole reload vajalik; uus kontroller teenindab järgmisi navigatsioone ise.
-    if(controllerReloaded || !hadController || !isHomeIdle()) return;
+    if(controllerReloaded || !hadController) return;
+    if(!isHomeIdle()){ pendingReload = true; return; } // reload hiljem, kui ollakse avaekraanil
     controllerReloaded=true;
     location.reload();
   });
+
+  // SW teatab, kui ta serveeris aeglase võrgu tõttu vana lehte ja leidis taustal uue.
+  navigator.serviceWorker.addEventListener('message', e => {
+    if(e.data && e.data.type === 'shell-updated') pendingReload = true;
+  });
+  setInterval(() => {
+    if(pendingReload && hadController && !controllerReloaded && isHomeIdle()){
+      controllerReloaded = true;
+      location.reload();
+    }
+  }, 2000);
 
   navigator.serviceWorker.register('./offline-sw.js', {updateViaCache:'none'}).then(async reg => {
     swRegistration=reg;
@@ -2712,6 +2736,7 @@ showHomeScreen();
   }).catch(() => { status.textContent='Offline-teenuse käivitamine ebaõnnestus.'; });
 
   document.addEventListener('visibilitychange', () => {
+    if(document.visibilityState==='visible' && offlineInstallRunning) acquireWakeLock();
     if(document.visibilityState==='visible' && !offlineInstallRunning && swRegistration){
       swRegistration.update().catch(()=>{});
     }
@@ -2719,7 +2744,8 @@ showHomeScreen();
 
   btn.addEventListener('click', async () => {
     btn.disabled=true; delBtn.disabled=true; offlineInstallRunning=true;
-    status.textContent='Valmistan offline-paketti…';
+    acquireWakeLock();
+    status.textContent='Valmistan offline-paketti… (hoia leht avatuna)';
     try{
       await navigator.serviceWorker.ready;
       const cache=await caches.open(MEDIA_CACHE);
@@ -2727,11 +2753,13 @@ showHomeScreen();
       // offline-assets.json ja selle failid kuuluvad media/offline paketti, mitte SW app-cache'i.
       const response=await fetch('./offline-assets.json',{cache:'no-store'});
       if(!response.ok) throw new Error('manifest');
-      const assets=await response.json(); let coreDone=0;
+      const assets=await response.json(); let coreDone=0, assetFailed=0;
       for(const asset of assets){
-        const req=new Request(asset,{cache:'reload'}); const res=await fetch(req);
-        if(!res.ok) throw new Error(asset); await cache.put(req,res.clone());
-        coreDone++; status.textContent=`Rakenduse failid: ${coreDone} / ${assets.length}`;
+        try{
+          const req=new Request(asset,{cache:'reload'}); const res=await fetch(req);
+          if(!res.ok) throw new Error(asset); await cache.put(req,res.clone());
+        }catch(e){ assetFailed++; }
+        coreDone++; status.textContent=`Rakenduse failid: ${coreDone} / ${assets.length}`+(assetFailed?` · vigu ${assetFailed}`:'');
       }
 
       const names=commonsFilenames();
@@ -2754,6 +2782,16 @@ showHomeScreen();
       const workingMap=listingComplete?resolvedMap:{...oldMap,...resolvedMap};
       const jobs=names.filter(name=>{const x=workingMap[offlineMapKey(name)]||workingMap[name];return x&&x.url;});
       let next=0,done=0,added=0,downloadFailed=0,downloadedBytes=0; const startedAt=performance.now();
+      // Vahepunktid: kaart kirjutatakse regulaarselt, et katkenud install jääks kasutatavaks ja jätkatavaks.
+      const progressMap={}; let sinceCheckpoint=0, checkpointBusy=false, checkpointPromise=Promise.resolve();
+      function noteDone(name, info, virtualUrl){
+        const entry={...info, offlineUrl:virtualUrl};
+        progressMap[offlineMapKey(name)]=entry; progressMap[normalizeFilename(name)]=entry;
+        if(++sinceCheckpoint>=15 && !checkpointBusy){
+          sinceCheckpoint=0; checkpointBusy=true;
+          checkpointPromise=writeMap(cache,{...oldMap,...progressMap}).catch(()=>{}).then(()=>{ checkpointBusy=false; });
+        }
+      }
       async function worker(){
         while(true){
           const idx=next++; if(idx>=jobs.length)return;
@@ -2762,13 +2800,21 @@ showHomeScreen();
             const virtualUrl=info.offlineUrl||offlineImageUrl(name); info.offlineUrl=virtualUrl;
             let existing=await cache.match(virtualUrl,{ignoreVary:true});
             if(!existing){
-              const imgRes=await fetch(info.url,{mode:'cors',cache:'reload'}); if(!imgRes.ok)throw new Error('image-http-'+imgRes.status);
-              const blob=await imgRes.blob(); if(!blob||!blob.size)throw new Error('image-empty');
-              const contentType=blob.type||imgRes.headers.get('Content-Type')||'image/jpeg'; if(!contentType.toLowerCase().startsWith('image/'))throw new Error('image-content-type-'+contentType);
-              await cache.put(virtualUrl,new Response(blob,{status:200,headers:{'Content-Type':contentType,'Content-Length':String(blob.size),'Cache-Control':'public, max-age=31536000, immutable'}}));
-              existing=await cache.match(virtualUrl,{ignoreVary:true}); if(!existing)throw new Error('cache-verify');
-              added++; downloadedBytes+=blob.size||0;
+              let lastErr=null;
+              for(let attempt=0; attempt<3 && !existing; attempt++){
+                try{
+                  if(attempt) await new Promise(r=>setTimeout(r, attempt*1500));
+                  const imgRes=await fetch(info.url,{mode:'cors',cache:'reload'}); if(!imgRes.ok)throw new Error('image-http-'+imgRes.status);
+                  const blob=await imgRes.blob(); if(!blob||!blob.size)throw new Error('image-empty');
+                  const contentType=blob.type||imgRes.headers.get('Content-Type')||'image/jpeg'; if(!contentType.toLowerCase().startsWith('image/'))throw new Error('image-content-type-'+contentType);
+                  await cache.put(virtualUrl,new Response(blob,{status:200,headers:{'Content-Type':contentType,'Content-Length':String(blob.size),'Cache-Control':'public, max-age=31536000, immutable'}}));
+                  existing=await cache.match(virtualUrl,{ignoreVary:true}); if(!existing)throw new Error('cache-verify');
+                  added++; downloadedBytes+=blob.size||0;
+                }catch(e){ lastErr=e; }
+              }
+              if(!existing) throw lastErr||new Error('download');
             }
+            noteDone(name, info, virtualUrl);
           }catch(e){downloadFailed++;}
           done++; const pct=jobs.length?Math.round(done/jobs.length*100):100; const sec=Math.max(.1,(performance.now()-startedAt)/1000); const rate=done/sec; const remain=rate>0?Math.ceil((jobs.length-done)/rate):0;
           status.textContent=`Pildid ${done} / ${jobs.length} · ${pct}%`+(downloadedBytes?` · ${formatMB(downloadedBytes)}`:'')+(added?` · uusi ${added}`:'')+(downloadFailed?` · vigu ${downloadFailed}`:'')+(remain>0?` · ~${remain}s`:'');
@@ -2776,6 +2822,7 @@ showHomeScreen();
       }
       await Promise.all(Array.from({length:Math.min(DOWNLOAD_CONCURRENCY,Math.max(1,jobs.length))},()=>worker()));
 
+      await checkpointPromise; // vahepunkt ei tohi lõppkaarti üle kirjutada
       // Map'i lähevad ainult kirjed, mille virtuaalne pilt on päriselt cache'is olemas.
       const verifiedMap={};
       for(const [key,info] of Object.entries(workingMap)){
@@ -2794,14 +2841,14 @@ showHomeScreen();
       await writeMap(cache,verifiedMap);
 
       const finalStats=await getOfflineImageStats(cache,verifiedMap,names);
-      const totalFailed=names.length-finalStats.count;
+      const imgMissing=names.length-finalStats.count; const totalFailed=imgMissing+assetFailed;
       btn.textContent=totalFailed?'Jätka offline laadimist':'Uuenda offline andmeid'; delBtn.style.display='';
-      status.textContent=totalFailed?`Offline-pakett pooleli · ${finalStats.count} / ${names.length} pilti · ${formatMB(finalStats.bytes)} · puudu ${totalFailed}`:`✓ Offline kasutuseks valmis · ${finalStats.count} pilti · ${formatMB(finalStats.bytes)}`;
+      status.textContent=totalFailed?`Offline-pakett pooleli · ${finalStats.count} / ${names.length} pilti · ${formatMB(finalStats.bytes)}`+(imgMissing?` · puudu ${imgMissing}`:'')+(assetFailed?` · rakenduse faile puudu ${assetFailed}`:''):`✓ Offline kasutuseks valmis · ${finalStats.count} pilti · ${formatMB(finalStats.bytes)}`;
       if(!totalFailed){ try{ await navigator.storage.persist?.(); }catch(e){} }
     }catch(err){
       status.textContent='Offline-laadimine ebaõnnestus. Kontrolli internetiühendust ja proovi uuesti.';
     }finally{
-      offlineInstallRunning=false; btn.disabled=false; delBtn.disabled=false;
+      offlineInstallRunning=false; releaseWakeLock(); btn.disabled=false; delBtn.disabled=false;
     }
   });
 
