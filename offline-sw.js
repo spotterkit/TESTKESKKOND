@@ -1,5 +1,5 @@
 // Service Worker lifecycle release. SW_VERSION on ainult versioonimärk (peab klappima APP_BUILD-iga).
-const SW_VERSION = 'offline-rc6';
+const SW_VERSION = 'offline-rc7';
 const APP_CACHE = 'tehnikatuvastus-app-' + SW_VERSION;
 // MEDIA nime EI TOHI muuta: olemasolevad Commonsi offline-pildid peavad release'ide vahel säilima.
 const MEDIA_CACHE = 'tehnikatuvastus-offline-final-v13';
