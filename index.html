@@ -622,12 +622,16 @@ window.addEventListener('error', function(){ window.__bootErrors++; });
         </div>
 
         <div class="home-divider">Harjutamine</div>
-        <div class="home-eyebrow">Vali harjutuskategooriad</div>
-        <div class="home-select-actions">
-          <button type="button" id="selectAllBtn">Vali kõik</button>
-          <button type="button" id="clearAllBtn">Tühista kõik</button>
+        <div class="row" style="margin-bottom:10px;">
+          <button type="button" id="groupToggleBtn" style="flex:1;" aria-expanded="false" aria-controls="practiceGroupsPanel">Vali harjutuskategooriad ▾</button>
         </div>
-        <div class="home-group-grid" id="groupGrid"></div>
+        <div id="practiceGroupsPanel" hidden>
+          <div class="home-select-actions">
+            <button type="button" id="selectAllBtn">Vali kõik</button>
+            <button type="button" id="clearAllBtn">Tühista kõik</button>
+          </div>
+          <div class="home-group-grid" id="groupGrid"></div>
+        </div>
         <div class="stats-line" id="statsLine"></div>
         <div class="row">
           <button class="primary" id="startPracticeBtn" style="flex:1;">Harjuta valitud kategooriaid</button>
@@ -2788,6 +2792,18 @@ skipBtn.addEventListener('click', () => {
 menuBtn.addEventListener('click', goHome);
 titleHome.addEventListener('click', goHome);
 startPracticeBtn.addEventListener('click', startPractice);
+(function(){
+  // Harjutuskategooriate nimekiri on vaikimisi suletud; nupp avab/sulgeb selle. Valik säilib sulgemisel.
+  const toggle = document.getElementById('groupToggleBtn');
+  const panel = document.getElementById('practiceGroupsPanel');
+  if(!toggle || !panel) return;
+  toggle.addEventListener('click', () => {
+    const open = panel.hidden;
+    panel.hidden = !open;
+    toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    toggle.textContent = 'Vali harjutuskategooriad ' + (open ? '▴' : '▾');
+  });
+})();
 selectAllBtn.addEventListener('click', selectAllGroups);
 clearAllBtn.addEventListener('click', clearAllGroups);
 startTestBtn.addEventListener('click', startTest);
@@ -2890,7 +2906,7 @@ showHomeScreen();
   const hadController = !!navigator.serviceWorker.controller;
   let controllerReloaded = false;
   let swRegistration = null;
-  const APP_BUILD = 'rc6'; // tõsta iga release'iga koos SW_VERSION-iga ('offline-' + APP_BUILD); kuvatakse oleku real
+  const APP_BUILD = 'rc7'; // tõsta iga release'iga koos SW_VERSION-iga ('offline-' + APP_BUILD); kuvatakse oleku real
   // Jaluse versioonirida: näitab, millist lehte brauser PRAEGU käitab (ka enne offline-paketi laadimist).
   const buildLabel = document.getElementById('appBuildLabel');
   if(buildLabel) buildLabel.textContent = 'versioon ' + APP_BUILD;
